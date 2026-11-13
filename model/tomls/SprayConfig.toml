@@ -66,7 +66,10 @@ outside_total_cycles_max = 5
 stage_detect_frame_count = 8
 
 # 按帧 X 轴搜索模式：0=使用原点和Y往复行程的静态范围，1=使用当前Y位置的动态逐枪范围
-frame_x_interpolation_enabled = 1
+frame_x_interpolation_enabled = 0
+
+# 插补关闭时出粉Y范围：喷枪原点Y到原点Y+当前Y位置，两端各扩展此距离，单位mm；0有效，插补开启时不使用
+frame_x_static_spray_y_margin = 50
 
 # 当前喷枪矩形区域无有效点云时的X目标：0=回安全位置，1=使用本帧其他有效区域的全局x_min；全部无数据仍回安全位置
 frame_x_no_data_target_mode = 1

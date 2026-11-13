@@ -7,12 +7,7 @@ from acquisition_sdk import BlockData, SingleMachineData
 from model.gun_distributors.BaseGunDistributor import BaseGunDistributor
 from model.gun_distributors.DefaultGunDistributor import DefaultGunDistributor
 from model.gun_distributors.InUpGunDistributor import InUpGunDistributor
-from model.gun_distributors.OutDownGunDistributor import OutDownGunDistributor
-from model.gun_distributors.OutFxGunDistributor import OutFxGunDistributor
-from model.gun_distributors.OutUpGunDistributor import OutUpGunDistributor
-from model.gun_distributors.XNIndependentYGunDistributor import XNIndependentYGunDistributor
 from model.gun_distributors.XNSharedYGunDistributor import XNSharedYGunDistributor
-from model.gun_distributors.XNUpDown4GunDistributor import XNUpDown4GunDistributor
 
 
 class GunDistributor:
@@ -36,11 +31,6 @@ class GunDistributor:
         self.base_distributor = BaseGunDistributor()
         self.in_up_distributor = InUpGunDistributor()
         self.shared_side_distributor = XNSharedYGunDistributor()
-        self.independent_side_distributor = XNIndependentYGunDistributor()
-        self.updown4_distributor = XNUpDown4GunDistributor()
-        self.out_down_distributor = OutDownGunDistributor()
-        self.out_fx_distributor = OutFxGunDistributor()
-        self.out_up_distributor = OutUpGunDistributor()
         self.default_distributor = DefaultGunDistributor()
 
     def distribute_for_machine(self, blockdata: BlockData, machine_cfg: dict, machine_id: Optional[int] = None) -> BlockData:
@@ -69,14 +59,7 @@ class GunDistributor:
         return blockdata
 
     def _get_xn_side_distributor(self):
-        raw_mode = self.spray_cfg.get("xn_side_y_mode", 0)
-        try:
-            y_mode = int(raw_mode)
-        except (TypeError, ValueError):
-            y_mode = 0
-
-        if y_mode == 1:
-            return self.independent_side_distributor
+        # raw_mode = self.spray_cfg.get("xn_side_y_mode", 0)
         return self.shared_side_distributor
 
     def _build_machine_distribution(self, blockdata, machine_cfg, machine_id, is_cabinet, spray_width_distance, gun_distance):
@@ -85,9 +68,6 @@ class GunDistributor:
             return None
 
         if not is_cabinet:
-            if machine_type in self.OUT_FX_MACHINE_TYPES:
-                gun_groups = self.out_fx_distributor.distribute(blockdata, machine_cfg, gun_distance)
-                return SingleMachineData(machine_id=machine_id, gun_groups=gun_groups)
             if machine_type in self.XN_SIDE_MACHINE_TYPES:
                 flat_blockdata = deepcopy(blockdata)
                 flat_blockdata.inside_data = []
@@ -98,16 +78,8 @@ class GunDistributor:
 
         if machine_type in self.IN_UP_MACHINE_TYPES:
             gun_groups = self.in_up_distributor.distribute(blockdata, machine_cfg)
-        elif machine_type in self.XN_UPDOWN4_MACHINE_TYPES:
-            gun_groups = self.updown4_distributor.distribute(blockdata, machine_cfg, spray_width_distance)
         elif machine_type in self.XN_SIDE_MACHINE_TYPES:
             gun_groups = self._get_xn_side_distributor().distribute(blockdata, machine_cfg, gun_distance)
-        elif machine_type in self.OUT_UP_MACHINE_TYPES:
-            gun_groups = self.out_up_distributor.distribute(blockdata, machine_cfg)
-        elif machine_type in self.OUT_DOWN_MACHINE_TYPES:
-            gun_groups = self.out_down_distributor.distribute(blockdata, machine_cfg)
-        elif machine_type in self.OUT_FX_MACHINE_TYPES:
-            gun_groups = self.out_fx_distributor.distribute(blockdata, machine_cfg, gun_distance)
         else:
             gun_groups = self.default_distributor.distribute(machine_cfg)
 

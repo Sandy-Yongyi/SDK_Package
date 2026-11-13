@@ -26,12 +26,12 @@ class QtPointCloudViewTests(unittest.TestCase):
                 view.reset_camera()
             origin, x, y, z = view.project_points(np.array([[0, 0, 0], [10, 0, 0], [0, 10, 0], [0, 0, 10]]))
             self.assertAlmostEqual(x[0], origin[0], places=3)
-            self.assertLess(x[1], origin[1])
+            self.assertGreater(x[1], origin[1])
             self.assertGreater(abs(z[0] - origin[0]), 0)
             self.assertAlmostEqual(z[1], origin[1], places=3)
             self.assertLess(y[1], origin[1])
             self.assertAlmostEqual(y[0], origin[0], places=3)
-            self.assertLess((view.camera_matrix()[:3, :3] @ np.array([10, 0, 0]))[2], 0)
+            self.assertGreater((view.camera_matrix()[:3, :3] @ np.array([10, 0, 0]))[2], 0)
             self.assertAlmostEqual(np.linalg.det(view.camera_matrix()[:3, :3]), 1, places=5)
         np.testing.assert_array_equal(points, view.points)
 
@@ -158,7 +158,7 @@ class QtPointCloudViewTests(unittest.TestCase):
         view.set_points(np.array([[-10, 0, 0], [10, 0, 0]], dtype=np.float32))
         view.rotation_x = view.rotation_y = 0
         self.assertTrue(view.pick_orbit_center(QPointF(400, 300)))
-        np.testing.assert_allclose(view.scene_center, [-10, 0, 0])
+        np.testing.assert_allclose(view.scene_center, [10, 0, 0])
 
     def test_double_click_can_pick_point_after_first_processing_chunk(self):
         from types import SimpleNamespace

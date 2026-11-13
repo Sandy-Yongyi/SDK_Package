@@ -102,10 +102,10 @@ class QtPointCloudView(QOpenGLWidget):
         cp, sp, cy, sy = np.cos(pitch), np.sin(pitch), np.cos(yaw), np.sin(yaw)
         rotate_x = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
         rotate_y = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
-        # Look from negative X: Y stays up, Z horizontal, positive X away from us.
+        # Look from positive X: Y stays up, positive X points towards us.
         # The small initial pitch exposes the X-Z ground grid instead of its edge.
         # This is a camera rotation, leaving point/box and PLC coordinates intact.
-        base = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]])
+        base = np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]])
         matrix = np.eye(4, dtype=np.float32)
         matrix[:3, :3] = rotate_x @ rotate_y @ base
         matrix[:3, 3] = -(matrix[:3, :3] @ self.scene_center)

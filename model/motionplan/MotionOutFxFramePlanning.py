@@ -76,7 +76,7 @@ class FrameStateResult:
 
 
 class MotionOutFxFramePlanning:
-    """按帧模式下外侧仿形自动喷涂规划。"""
+    """外侧仿形自动喷涂规划。"""
 
     FRAME_CONFIG_DEFAULTS = {
         "stage_detect_frame_count": 8,
@@ -85,6 +85,7 @@ class MotionOutFxFramePlanning:
         "frame_idle_y_reciprocate_enabled": 1,
         "frame_x_no_data_target_mode": 0,
         "frame_x_dynamic_speed_mode": 1,
+        "frame_x_static_spray_y_margin": 50,
     }
 
     def __init__(self, spray_cfg=None, read_data_cfg=None, motion_to_target=None):
@@ -421,6 +422,9 @@ class MotionOutFxFramePlanning:
             if value not in (0, 1):
                 return f"{name} must be 0 or 1, current value: {value}"
 
+        if self._get_frame_config("frame_x_static_spray_y_margin") < 0:
+            return "frame_x_static_spray_y_margin must be greater than or equal to 0"
+
         slow_in_out_enabled = self._get_frame_config("frame_x_slow_in_out_enabled")
         cycle_axis = str(self.spray_cfg.get("side_2d_cycle_axis", "y")).lower()
         if cycle_axis not in {"x", "y"}:
@@ -613,8 +617,14 @@ class MotionOutFxFramePlanning:
         after_offset = int(runtime_cfg.get("out_after_x_offset", machine_cfg.get("out_after_x_offset", 0)) or 0)
         targets_cached = state.tracking_recip_x_min_target is not None and state.tracking_recip_x_max_target is not None
         if not targets_cached and (static_result.global_x_min is None or static_result.global_x_max is None):
-            return {axis_name: self._build_no_data_x_command(machine_cfg, runtime_cfg, axis_name, None, front_offset)
-                    for axis_name in axis_names}
+            axis_cmds = {}
+            for axis_name in axis_names:
+                command = self._build_no_data_x_command(machine_cfg, runtime_cfg, axis_name, None, front_offset)
+                search_y_range = self._get_x_status_y_range(machine_cfg, plc_data, axis_name, static_result.search_y_ranges.get(axis_name))
+                command.Status = int(search_y_range is not None and chain_running
+                                     and self._has_x_status_data(frames, window, search_y_range[0], search_y_range[1], runtime_cfg, machine_cfg))
+                axis_cmds[axis_name] = command
+            return axis_cmds
 
         if not targets_cached:
             x_min_limit, x_max_limit = get_axis_position_limits(machine_cfg, "x")
@@ -633,7 +643,7 @@ class MotionOutFxFramePlanning:
         x_recip_speed = int(runtime_cfg.get("x_recip_speed", machine_cfg.get("x_recip_speed", 0)) or 0)
 
         if not state.x_initialized:
-            if axis_positions and all(abs(position - target_min) <= self.spray_pos_tolerance for position in axis_positions):  # type: ignore
+            if axis_positions and all(abs(position - target_min) <= self.spray_pos_tolerance for position in axis_positions):
                 state.x_initialized = True
                 state.x_phase = "to_max"
                 target = target_max
@@ -644,7 +654,7 @@ class MotionOutFxFramePlanning:
                 speed = x_pos_speed
         else:
             target = target_max if state.x_phase == "to_max" else target_min
-            if axis_positions and all(abs(position - target) <= self.spray_pos_tolerance for position in axis_positions):  # type: ignore
+            if axis_positions and all(abs(position - target) <= self.spray_pos_tolerance for position in axis_positions):
                 if state.x_phase == "to_max":
                     state.x_phase = "to_min"
                     target = target_min
@@ -657,7 +667,7 @@ class MotionOutFxFramePlanning:
         x_speed_limit = get_axis_speed_limit(machine_cfg, "x")
         axis_cmds = {}
         for axis_name in axis_names:
-            search_y_range = static_result.search_y_ranges.get(axis_name)
+            search_y_range = self._get_x_status_y_range(machine_cfg, plc_data, axis_name, static_result.search_y_ranges.get(axis_name))
             status = int(search_y_range is not None and chain_running
                          and self._has_x_status_data(frames, window, search_y_range[0], search_y_range[1], runtime_cfg, machine_cfg))
             axis_cmds[axis_name] = build_axis(target, speed, status, x_speed_limit)
@@ -674,16 +684,17 @@ class MotionOutFxFramePlanning:
         for axis_name in self._get_x_axis_names(machine_cfg):
             gun_range = static_result.gun_ranges.get(axis_name)
             has_region_data = gun_range is not None
+            search_y_range = self._get_x_status_y_range(machine_cfg, plc_data, axis_name, static_result.search_y_ranges.get(axis_name))
+            status = int(search_y_range is not None and chain_running
+                         and self._has_x_status_data(frames, window, search_y_range[0], search_y_range[1], runtime_cfg, machine_cfg))
             if has_region_data:
                 base_x_min = gun_range[0]
             else:
                 axis_cmds[axis_name] = self._build_no_data_x_command(machine_cfg, runtime_cfg, axis_name, static_result.global_x_min, current_x_offset)
+                axis_cmds[axis_name].Status = status
                 continue
 
             target = self.x_motion_helper.build_final_x_target(base_x_min, x_position, current_x_offset, x_min_limit, x_max_limit)
-            search_y_range = static_result.search_y_ranges.get(axis_name)
-            status = int(has_region_data and search_y_range is not None and chain_running
-                         and self._has_x_status_data(frames, window, search_y_range[0], search_y_range[1], runtime_cfg, machine_cfg))
             axis_cmds[axis_name] = build_axis(target, speed, status, speed_limit)
         return axis_cmds
 
@@ -721,19 +732,20 @@ class MotionOutFxFramePlanning:
         for axis_name in self._get_x_axis_names(machine_cfg):
             gun_range = range_result.gun_ranges.get(axis_name)
             has_region_data = gun_range is not None
+            search_y_range = self._get_x_status_y_range(machine_cfg, plc_data, axis_name, range_result.search_y_ranges.get(axis_name))
+            status = int(search_y_range is not None and chain_running
+                         and self._has_x_status_data(frames, window, search_y_range[0], search_y_range[1], runtime_cfg, machine_cfg))
             if has_region_data:
                 base_x_min = gun_range[0]
             elif no_data_mode == 1 and range_result.global_x_min is not None:
                 base_x_min = range_result.global_x_min
             else:
                 axis_cmds[axis_name] = self._build_no_data_x_command(machine_cfg, runtime_cfg, axis_name, None, current_x_offset)
+                axis_cmds[axis_name].Status = status
                 continue
 
             target = self.x_motion_helper.build_final_x_target(base_x_min, x_position, current_x_offset, x_min_limit, x_max_limit)
             speed = self._resolve_dynamic_x_speed(state, axis_name, y_cur, y_bin, base_x_min, target, y_recip_speed, x_speed_limit, x_pos_speed)
-            search_y_range = range_result.search_y_ranges.get(axis_name)
-            status = int(has_region_data and search_y_range is not None and chain_running
-                         and self._has_x_status_data(frames, window, search_y_range[0], search_y_range[1], runtime_cfg, machine_cfg))
             axis_cmds[axis_name] = build_axis(target, speed, status, x_speed_limit)
         return axis_cmds
 
@@ -810,11 +822,23 @@ class MotionOutFxFramePlanning:
         x_min_limit, x_max_limit = get_axis_position_limits(machine_cfg, axis_name)
         return build_axis(clamp_to_limit_yx(current_position, x_min_limit, x_max_limit), 0, 0, get_axis_speed_limit(machine_cfg, axis_name))
 
+    def _get_x_status_y_range(self, machine_cfg, plc_data, axis_name, motion_search_y_range):
+        """插补复用运动搜索范围；非插补从喷枪原点到当前高度，两端增加出粉余量。"""
+        if self._get_frame_config("frame_x_interpolation_enabled") == 1:
+            return motion_search_y_range
+
+        index = self._get_x_axis_names(machine_cfg).index(axis_name)
+        origin_y = int(machine_cfg["origin_pos"][index])
+        y_cur = self._get_axis_pos(machine_cfg, plc_data, self._get_logical_y_axis_name(machine_cfg))
+        margin = self._get_frame_config("frame_x_static_spray_y_margin")
+        return origin_y + min(0, y_cur) - margin, origin_y + max(0, y_cur) + margin
+
     def _has_x_status_data(self, frames, window, search_y_min, search_y_max, runtime_cfg, machine_cfg):
+        """共用定位窗口，仅向前扩展预出粉范围；尾部关闭边界保持不变。"""
         x_status_offset = int(runtime_cfg.get("x_status_offset", machine_cfg.get("x_status_offset", 0)) or 0)
         offset_frames = max(0, int(x_status_offset / self.z_threshold))
         start_index = max(0, window.start - offset_frames)
-        end_index = max(start_index, window.end - offset_frames)
+        end_index = window.end
         return bool(self.frame_helper.collect_x_min_values(frames, start_index, end_index, min(search_y_min, search_y_max), max(search_y_min, search_y_max)))
 
     def _build_x_axis_commands(self, machine_cfg, runtime_cfg, chain_running, frames, z_start_idx, z_end_idx, y_min_target, y_max_target):

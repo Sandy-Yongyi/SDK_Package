@@ -33,7 +33,7 @@ class RealtimeControlPage(QWidget):
         fit_button = ControlButton("适配视图")
         fit_button.clicked.connect(self.point_cloud_view.reset_camera)
         view_tools.addWidget(QLabel("三维工作区  ·  左键旋转 / 右键平移 / 滚轮缩放"))
-        self.point_cloud_view.setToolTip("默认从 X 负方向观察，Z 轴水平、Y 轴竖直，网格位于 X–Z 地面。左键拖动旋转，右键拖动平移，滚轮缩放；双击点云设置旋转中心，适配视图恢复整体视角。")
+        self.point_cloud_view.setToolTip("默认从 X 正方向观察，Z 轴水平、Y 轴竖直，网格位于 X–Z 地面。左键拖动旋转，右键拖动平移，滚轮缩放；双击点云设置旋转中心，适配视图恢复整体视角。")
         view_tools.addStretch(1)
         view_tools.addWidget(fit_button)
         center.addLayout(view_tools)
@@ -145,12 +145,20 @@ class RealtimeControlPage(QWidget):
             badge.set_status(f"{name} · {detail}" if detail else name, bool(device and device.online))
 
 
+def device_name(sn, machine_type, strategy_name):
+    from model.utils.MachineConfiguration import load_machine_config_for_ui
+    config = load_machine_config_for_ui(sn, strategy_name)
+    side = {"left": "左侧", "right": "右侧"}.get(config.get("install_orietation"), "")
+    kind = {"out_fx": "外仿形", "xn_side": "云雀", "xn_rotate": "云雀旋转", "z_2d_lift": "二维升降"}.get(machine_type, machine_type)
+    return f"{side}{kind}" if side else f"SN {sn} · {kind}"
+
+
 class DeviceControlPage(QWidget):
-    DEVICE_NAMES = ("左侧内外顶", "左侧内外底", "左侧二维", "右侧内外顶", "右侧内外底", "右侧二维")
 
     def __init__(self, controller, parent=None):
         super().__init__(parent)
         self.controller = controller
+        self.strategy_name = getattr(controller, "strategy_name", "frame_by_frame")
         self._available = False
         self._last_mask = None
         self._pc_auto_mode = None
@@ -178,16 +186,32 @@ class DeviceControlPage(QWidget):
             self.device_grid.addWidget(label, 1, column)
             self.device_grid.setColumnStretch(column, 1)
         self.device_buttons = []
-        for index, name in enumerate(self.DEVICE_NAMES):
-            button = ControlButton(name)
-            button.setCheckable(True)
-            button.clicked.connect(self._send)
-            self.device_buttons.append(button)
-            self.device_grid.addWidget(button, index % 3 + 2, index // 3)
+        self._reload_devices()
         panel.content_layout.addLayout(self.device_grid)
         layout.addWidget(panel)
         layout.addStretch(1)
         self._sync()
+
+    def _reload_devices(self):
+        from model.utils.MachineConfiguration import list_machine_devices, load_machine_config_for_ui
+        for button in getattr(self, "device_buttons", []):
+            self.device_grid.removeWidget(button)
+            button.deleteLater()
+        self.device_buttons = []
+        self.device_sns = []
+        rows = [0, 0]
+        for sn, machine_type in list_machine_devices(self.strategy_name):
+            config = load_machine_config_for_ui(sn, self.strategy_name)
+            column = 1 if config.get("install_orietation") == "right" else 0
+            name = device_name(sn, machine_type, self.strategy_name)
+            button = ControlButton(name)
+            button.setCheckable(True)
+            button.clicked.connect(self._send)
+            self.device_buttons.append(button)
+            self.device_sns.append(sn)
+            self.device_grid.addWidget(button, rows[column] + 2, column)
+            rows[column] += 1
+        self._last_sync_signature = None
 
     def _sync(self):
         signature = (self._available, self._pc_auto_mode, self._all_safe, self.enable_button.isChecked(), tuple(b.isChecked() for b in self.device_buttons))
@@ -220,7 +244,7 @@ class DeviceControlPage(QWidget):
                 return
             mask = 0
             if self.enable_button.isChecked():
-                mask = 1 | sum(1 << i for i, b in enumerate(self.device_buttons, 1) if b.isChecked())
+                mask = 1 | sum(1 << (sn + 1) for sn, b in zip(self.device_sns, self.device_buttons) if b.isChecked())
             validate_enable_transition(self._last_mask or 0, mask, self._pc_auto_mode, self._all_safe)
             self.controller.set_device_enable_mask(mask)
             self._last_mask = mask
@@ -231,11 +255,15 @@ class DeviceControlPage(QWidget):
 
     def _set_mask(self, mask):
         self.enable_button.setChecked(bool(mask & 1))
-        for i, button in enumerate(self.device_buttons, 1):
-            button.setChecked(bool(mask & (1 << i)))
+        for sn, button in zip(self.device_sns, self.device_buttons):
+            button.setChecked(bool(mask & (1 << (sn + 1))))
         self._sync()
 
     def apply_state(self, state):
+        if self.strategy_name != state.strategy_name:
+            self.strategy_name = state.strategy_name
+            self._reload_devices()
+            self._last_mask = None
         self._pc_auto_mode = state.pc_auto_mode
         self._all_safe = state.all_devices_safe
         self._available = state.running and not state.stopping and any(d.name == "PLC" and d.online for d in state.devices)
@@ -314,8 +342,7 @@ class DeviceConfigurationPage(QWidget):
         try:
             devices = list_machine_devices(self.strategy_name)
             for index, (sn, machine_type) in enumerate(devices):
-                standard = self.strategy_name == "frame_by_frame" and 0 <= sn < 6
-                name = DeviceControlPage.DEVICE_NAMES[sn] if standard else f"SN {sn} · {machine_type}"
+                name = device_name(sn, machine_type, self.strategy_name)
                 button = ControlButton(name)
                 button.setCheckable(True)
                 button.clicked.connect(lambda checked=False, device_sn=sn: self._select_device(device_sn))

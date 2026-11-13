@@ -131,6 +131,9 @@ def parameter_order(sn: int, config: dict, strategy_name: str) -> list[tuple[str
     if strategy_name == "continuous_bidirectional":
         return [(key, CONTINUOUS_LABELS[key]) for key in CONTINUOUS_PARAM_KEYS.get(config.get("type", ""), ())]
     if strategy_name == "frame_by_frame":
+        if config.get("type") in ("out_fx", "xn_side"):
+            keys = DEVICE_PARAM_KEYS[0 if config.get("type") == "out_fx" else 1]
+            return [(key, PARAM_LABELS[key]) for key in keys]
         keys = {"inout_up": INOUT_UP_PARAM_KEYS,
                 "inout_down": INOUT_DOWN_PARAM_KEYS,
                 "H2D_XYservo": OUT_2D_SERVO_PARAM_KEYS,

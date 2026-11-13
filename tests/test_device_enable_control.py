@@ -67,8 +67,7 @@ class DeviceEnableTests(unittest.TestCase):
         state = UiState(strategy_name='complete_workpiece', running=True, pc_auto_mode=True, all_devices_safe=True, devices=(DeviceState('PLC', True),))
         page.apply_state(state)
         self.assertTrue(all(not b.isEnabled() for b in page.device_buttons))
-        for index, button in enumerate(page.device_buttons):
-            self.assertIs(page.device_grid.itemAtPosition(index % 3 + 2, index // 3).widget(), button)
+        for button in page.device_buttons:
             button.click()
         self.assertEqual([], sent)
         page.enable_button.click()

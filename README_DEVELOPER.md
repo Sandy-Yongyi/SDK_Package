@@ -134,7 +134,28 @@ SDK依然会导入开放的报文、分枪和公共工具，所以 `.pyd` 不是
 | 调整现有算法公开参数 | 十份 `model/tomls/*.toml` | 否 |
 | 更换雷达协议、改私有滤波/分区/保存实现 | 向SDK维护方提出需求 | 是 |
 
-报文开发注意：收发各134字节载荷、外层各4字节头尾；目前共20轴，大端序。`model.MovingFrameData.AxisData` 是PLC报文单轴，`acquisition_sdk.FrameAxisData` 是采数帧单轴，二者不可混用。修改轴数需同步 `AXIS_LIST_COUNT`、结构长度、PLC程序、`MachineAxisMap`及设备配置；只改TOML不能改变协议。
+### PLC 报文结构（当前 `MovingFrameData.py`）
+
+收发载荷均为 **302 字节**，大端序；外层帧头 `02 02 02 02`、帧尾 `03 03 03 03` 各 4 字节。读请求为 `02 02 02 02 01 03 03 03 03`。以下偏移均从载荷第 0 字节开始，不含帧头。
+
+| 方向 | 偏移 | 字段 | 类型/长度 | 用途 |
+| --- | ---: | --- | --- | --- |
+| 发送 | 0 | `Enable` | Int32 / 4 | 使能和设备控制位 |
+| 发送 | 4 | `Gun_Cont1` | Int32 / 4 | 开枪控制 1，保留 |
+| 发送 | 8 | `Gun_Cont2` | Int16 / 2 | 开枪控制 2，保留 |
+| 发送 | 10 | `HeartBeat` | Int16 / 2 | 心跳 |
+| 发送 | 12 | `Operate` | Int16 / 2 | bit 1 控制链条，bit 0 保留 |
+| 接收 | 0 | `ChainPulse` | Int32 / 4 | 链条脉冲数 |
+| 接收 | 4 | `ChainSpeed` | Int32 / 4 | 链条速度 |
+| 接收 | 8 | `HeartBeat` | Int16 / 2 | 心跳 |
+| 接收 | 10 | `Status` | Int16 / 2 | bit 0：1 为伺服正常，0 为报警 |
+| 接收 | 12 | `Operate` | Int16 / 2 | 使能和设备状态位 |
+| 收发 | 14 | `AxisList` | 48 × 6 | 每轴依次为 `Pos`、`Speed`、`Status`，各为 Int16 |
+| 收发 | 302 | 结束 | — | 轴数据正好填满载荷，无尾部填充 |
+
+当前报文注释对发送 `Enable` 和接收 `Operate` 的位定义为：bit 0 总使能，bit 1 右边内顶，bit 2 右边侧面云雀，bit 3 左边外底，bit 4 右外顶，bit 5 左外顶，bit 6 各轴清理模式。**这些名称与当前 `MachineConfig1/2` 的三台设备不一致，实际对应关系须与 PLC 程序确认，不能直接作为现场设备位映射。** 接收 `Status` 的其他位在当前报文定义中未说明。
+
+报文结构更新不等于运动逻辑已适配：逐帧规划使用新的 `Enable` 和 `Operate`，但完整工件及连续模式仍有使用旧发送字段的代码；当前 `MachineAxisMap.py` 也仍是旧设备的 20 轴映射。启用前需同步核对调用字段、设备位、轴顺序及 PLC 程序。`model.MovingFrameData.AxisData` 是 PLC 报文单轴，`acquisition_sdk.FrameAxisData` 是采数帧单轴，二者不可混用。修改轴数需同步 `AXIS_LIST_COUNT`、结构长度、PLC 程序、`MachineAxisMap` 及设备配置；只改 TOML 不能改变协议。
 
 分枪入口以 `distribute_for_machine(blockdata, machine_cfg, machine_id)` 返回该设备分枪结果；新增设备类型需在工厂分支选择对应分配器，并与运动规划的类型支持保持一致。保留 `BlockData` 等SDK数据结构约定，避免队列消费者拿到不同字段。
 

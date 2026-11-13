@@ -43,7 +43,7 @@ class ModeOrientationTests(unittest.TestCase):
                     view.resize(800, 600)
                     page.apply_state(UiState(strategy_name="complete_workpiece", points=scene))
                     np.testing.assert_allclose(view.points[:, 0], expected_x)
-                    self.assertLess(view.camera_matrix()[2, 0], 0)
+                    self.assertGreater(view.camera_matrix()[2, 0], 0)
                     original_camera = view.camera_matrix().copy()
                     view.rotation_x, view.rotation_y = 30, 80
                     view.reset_camera()
