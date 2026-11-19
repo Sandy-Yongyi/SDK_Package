@@ -2,6 +2,24 @@
 
 本文随开发交付包提供，可独立阅读。底层采集和处理以 `acquisition_sdk` 二进制库交付，项目控制、界面、报文、运动规划及分枪规则提供 Python 源码。SDK版本通过 `acquisition_sdk.__version__` 查询，Python接口版本通过 `acquisition_sdk.SDK_API_VERSION` 查询。
 
+## v0.1.1（2026-11-19）
+
+本版更新逐帧模式（`strategy_name = 1`）的激光异常恢复。SDK Python 接口版本仍为 `1`，本发布项目继续使用原有的 302 字节 PLC 载荷。
+
+1. 激光遮挡、异常或断连时，PLC 进程清空各方向的点云队列，停止链条并禁止自动跟随。已配置轴映射的设备独立回安全位，本机所有 X 到位后才让本机其余轴回位。Qt 显示故障原因与回位状态。
+2. 激光恢复且所有设备到位后，再清一次队列并重置同步基准。采集端在两次采样之间清缓存、重置采集标志，以此时的链条位置重新执行原有的 `send_direction_data()` 跳过判断。此阶段允许链条前进供采集判断，设备仍保持安全位。
+3. 若在 `start_skip_mm` 内已经看到工件，采集端等待连续全方向空采样达到阈值来确认尾部，再等下一件出现才发可用于恢复的帧。PLC 收到本轮通过判断的新帧后，才恢复入栈和自动跟随。
+
+编辑 `model/tomls/ReadDataConfig.toml` 中的现有键，保存并重启主程序与采集进程。
+
+| 配置 | 默认 | 作用 |
+| --- | ---: | --- |
+| `frame_fifo_step_mm` | `10` | 正整数，单位 mm。控制采集 FIFO 位置换算和 TXT 联调分帧。需要 5 mm 一帧时设为 `5`。 |
+| `start_skip_empty_frames` | `100` | 正整数。确认跳过工件的尾部所需的连续全方向空采样次数。检测到有效点云就重新计数。 |
+| `start_skip_mm` | `20` | 已有配置，控制启动及本次回位恢复后判断当前工件是否需要跳过的距离。 |
+
+`z_threshold` 继续控制原有数据查找与路径规划。更新时将本版 SDK、类型声明和开放控制代码一起替换，并把新增配置键合并进现场 TOML。当前仓库的 `MachineConfig1.toml` 包含 `out_fx`、`xn_side`，而本项目的 `MachineAxisMap.py` 尚未提供这两种机型的轴映射。缺少映射时故障恢复保持联锁。实际设备轴映射与 PLC 程序须经现场确认，本包的离线验收不包含实机回位。
+
 ## 1. 收到哪些文件
 
 ```text
@@ -11,6 +29,7 @@
 ├─ requirements.txt                     # Python 依赖清单
 ├─ acquisition_sdk.cp311-win_amd64.pyd    # 私有底层：Windows x64 / CPython 3.11
 ├─ acquisition_sdk.pyi                  # IDE 补全、参数和数据类型声明
+├─ SDK_API_GUIDE.md                     # pyi 接口用途、输入和输出说明
 ├─ control/                             # 开放：启停、进程、队列、PLC调度
 ├─ view/                                # 开放：Qt界面、参数展示、点云显示
 └─ model/                               # 开放：项目业务和配置
@@ -219,7 +238,7 @@ SDK依然会导入开放的报文、分枪和公共工具，所以 `.pyd` 不是
 | `plc_send_max_retries` | PLC发送重试上限；提高会延长故障处理等待，不会修复协议不匹配 |
 | `max_pulse` | 反馈脉冲回绕上限，必须与PLC一致，否则距离连续性错误 |
 | `pulse_to_mm` | 脉冲到毫米换算系数；影响距离和位置判断，按实际反馈单位标定 |
-| `fifo_unit_mm` | 每单位FIFO对应链条距离；影响帧与设备位置对齐 |
+| `fifo_unit_mm` | 模拟 PLC 每步推进的距离，单位 mm |
 | `diff_start_pulse` | 检测运动的脉冲差阈值；提高后微小运动更难触发 |
 | `lidar_connect_max_retries`、`plc_connect_max_retries` | 上层重连次数上限；越大越久才放弃，不是连接超时秒数 |
 | `raw_data_timeout_s` | 链条运动时无新激光数据的保护超时；减小更敏感，过小可能误停链 |

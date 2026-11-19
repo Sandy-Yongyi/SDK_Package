@@ -175,6 +175,7 @@ def main():
         shutil.copyfile(source, copied)
     if args.developer:
         shutil.copyfile(ROOT / 'README_DEVELOPER.md', target / 'README.md')
+        shutil.copyfile(ROOT / 'SDK_API_GUIDE.md', target / 'SDK_API_GUIDE.md')
     else:
         (target / 'SDK_USAGE.md').write_text('''# Acquisition SDK 0.1.0
 

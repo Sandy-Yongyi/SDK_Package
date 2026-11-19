@@ -31,7 +31,17 @@ class MotionFrameByFramePlanning:
         if force_disable_by_lidar or raw_data_timeout:
             stop_chain = True
 
-        if self._is_manual_mode_enabled(proc) and not force_disable_all:
+        lidar_interlock = (
+            lidar_abnormal
+            or getattr(proc, "lidar_fault_return_pending", False)
+            or getattr(proc, "lidar_recovery_required", False)
+        )
+        if lidar_interlock:
+            servo_ready = bool(int(proc.plc_data.Status) & 1)
+            enable_value = self._build_lidar_fault_return(proc, axis_list, not servo_ready)
+            # 回位时链条停止。恢复确认需要链条前进，但设备继续留在安全位。
+            stop_chain = lidar_abnormal or proc.lidar_fault_return_pending or not servo_ready
+        elif self._is_manual_mode_enabled(proc) and not force_disable_all:
             enable_value = self._build_manual_mode_enable_and_axes(proc, axis_list)
 
         # 自动模式 + 强制回原点场景都统一走该分支，通过 device_operate_enabled=False 实现
@@ -93,6 +103,34 @@ class MotionFrameByFramePlanning:
         moving_frame.HeartBeat = proc.plc_data.HeartBeat
         moving_frame.Operate = 0 if stop_chain else 0x02
         return moving_frame
+
+    def _build_lidar_fault_return(self, proc, axis_list, servo_alarm):
+        devices = [
+            (sn, cfg) for sn in range(proc.num_devices)
+            if (cfg := proc.machine_config.get(str(sn))) and cfg.get("type") != "out_lift"
+        ]
+        enable_value = 0
+        complete = True
+        for sn, cfg in devices:
+            if cfg.get("type") == "out_fx":
+                self.out_fx_planner.reset_motion_state(sn)
+                self.manual_out_fx_planner.reset_motion_state(sn)
+            if servo_alarm:
+                commands, ready = self.motion_to_target.hold_current_position(cfg, proc.plc_data), False
+            else:
+                commands, ready = self.motion_to_target.move_to_origin_safe(
+                    cfg, proc.runtime_machine_config.get(sn, {}), proc.plc_data
+                )
+                if commands and not ready:
+                    enable_value |= 1 << (sn + 1)
+            proc.device_origin_complete[sn] = ready
+            proc.device_returning_to_origin[sn] = not ready
+            complete = complete and ready
+            if commands:
+                apply_device_axes_to_list(proc.machine_config, sn, commands, axis_list)
+
+        proc.lidar_fault_return_pending = not complete
+        return enable_value | int(bool(enable_value))
 
     def _is_manual_mode_enabled(self, proc) -> bool:
         spray_mode = int(proc.mode_config.get("spray_mode", 0) or 0)

@@ -26,7 +26,7 @@ if __name__ == '__main__':
     assert sdk.__compiled__.module
     for name in sdk.__all__: getattr(sdk, name)
     from model.MovingFrameData import SendMovingFrameData
-    assert len(SendMovingFrameData().to_bytes()) == 134
+    assert len(SendMovingFrameData().to_bytes()) == 302
     ctx = mp.get_context('spawn'); queue = ctx.Queue()
     child = ctx.Process(target=worker, args=(queue,))
     try:
@@ -44,7 +44,10 @@ if __name__ == '__main__':
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--reuse-binary', action='store_true', help='Explicitly reuse output/sdk-full binary; do not use after private source changes')
+    parser.add_argument('--binary', type=Path, help='Use a previously built binary explicitly; do not use after private source changes')
     args = parser.parse_args()
+    if args.binary and args.reuse_binary:
+        parser.error('--binary and --reuse-binary cannot be combined')
     os.environ['PYTHONIOENCODING'] = 'utf-8'
     if sys.version_info[:2] != (3, 11) or sys.platform != 'win32' or sys.maxsize <= 2 ** 32:
         raise RuntimeError('Release requires Windows x64 CPython 3.11')
@@ -54,7 +57,9 @@ def main():
     output = ROOT / 'output/releases' / stamp
     output.mkdir(parents=True, exist_ok=False)
     binary = ROOT / 'output/sdk-full/acquisition_sdk.cp311-win_amd64.pyd'
-    if not args.reuse_binary:
+    if args.binary:
+        binary = args.binary.resolve()
+    elif not args.reuse_binary:
         build = ROOT / 'output/sdk-builds' / stamp
         subprocess.run([sys.executable, '-B', str(ROOT / 'tools/build_sdk.py'), '--developer-env', '--output-dir', str(build)], cwd=ROOT, check=True)
         binary = build / binary.name
@@ -84,7 +89,7 @@ def main():
     subprocess.run([sys.executable, '-B', str(extracted / 'main.py'), '--check-deployment'], cwd=output, timeout=60, check=True)
     result = {'archive': str(archive), 'sha256': hashlib.sha256(archive.read_bytes()).hexdigest(),
               'verified_files': len(manifest['files']), 'stub_exports': manifest['stub_exports'],
-              'reused_binary': args.reuse_binary, 'passed': True}
+              'reused_binary': bool(args.reuse_binary or args.binary), 'passed': True}
     (output / 'acceptance-result.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
     print(json.dumps(result), flush=True)
 
