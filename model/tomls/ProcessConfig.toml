@@ -12,6 +12,7 @@ beam_y_large_move_threshold = 100  # 连续有梁时，Y目标距反馈位置严
 
 ### 2. 查找分区算法参数 ###
 jig_threshold = 30                 # 挂具距离最上平面y的起始距离
+max_jig_count = 5  # 单个工件最多保留的挂具数量
 x_range = 300                      # 判断为柜体的x轴范围,需大于才是柜体,否则为平板
 y_range = 300                      # 判断为柜体的y轴范围
 z_range = 300                      # 判断为柜体的z轴范围

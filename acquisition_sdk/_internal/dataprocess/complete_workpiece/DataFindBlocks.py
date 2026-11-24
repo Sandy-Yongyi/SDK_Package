@@ -23,6 +23,7 @@ class DataFindBlocks:
         self.data_partition_auto = DataPartitionAuto()
         self.process_config = TomlLoader.load(os.getcwd() + "\\model\\tomls\\ProcessConfig.toml")
         self.find_y_plane = self.process_config["find_y_plane"]
+        self.max_jig_count = self.process_config.get("max_jig_count", 5)
         # if self.process_config["draw_type"] != 0:
         #     self.visualizer = PointCloudVisualizer()
         #     self.visualizer.close_visualization = self.visualizer.close_visualization
@@ -656,7 +657,7 @@ class DataFindBlocks:
         # 处理未结束的Jig
         if current_jig is not None:
             current_jig["z_end"] = z_pos
-            if len(jig_data) < 2:
+            if len(jig_data) < self.max_jig_count:
                 jig_data.append(current_jig)
 
         # 处理未闭合的内侧分区（超过10帧视为有效）
@@ -838,7 +839,9 @@ class DataFindBlocks:
         if concatenated_data is None:
             return None
         jig_data_list = []
-        for idx, jig in enumerate(concatenated_data.get("jig_data", [])[:5]):  # 最多五组
+        for idx, jig in enumerate(
+            concatenated_data.get("jig_data", [])[:self.max_jig_count]
+        ):
             jig_data_list.append(
                 JigData(
                     jig_id=idx,

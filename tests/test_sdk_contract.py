@@ -33,7 +33,7 @@ class SdkContractTests(unittest.TestCase):
         code = """
 import sys, multiprocessing
 import acquisition_sdk as sdk
-assert (sdk.__version__, sdk.SDK_API_VERSION) == ('0.1.1', 1)
+assert (sdk.__version__, sdk.SDK_API_VERSION) == ('0.1.2', 1)
 from acquisition_sdk import BlockData, AxisFrameData, PlcFrame, Int16
 assert 'model.utils.LoggerUtil' not in sys.modules
 assert 'open3d' not in sys.modules
@@ -48,8 +48,8 @@ assert not multiprocessing.active_children()
         self.assertTrue(issubclass(AxisData, PlcFrame))
         self.assertIsNot(AxisData, FrameAxisData)
         self.assertIsInstance(AxisFrameData([FrameAxisData(10, 20, 5)]).FrameData[0], FrameAxisData)
-        self.assertEqual(134, len(SendMovingFrameData().to_bytes()))
-        self.assertEqual(134, len(ReceiveMovingFrameData().to_bytes()))
+        self.assertEqual(302, len(SendMovingFrameData().to_bytes()))
+        self.assertEqual(302, len(ReceiveMovingFrameData().to_bytes()))
 
     def test_open_project_code_uses_only_supported_sdk_imports(self):
         offenders = []

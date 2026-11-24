@@ -6,7 +6,7 @@ the compiled acquisition_sdk extension while keeping the same imports.
 
 from importlib import import_module
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 SDK_API_VERSION = 1
 
 _EXPORT_GROUPS = {

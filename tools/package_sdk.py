@@ -177,7 +177,7 @@ def main():
         shutil.copyfile(ROOT / 'README_DEVELOPER.md', target / 'README.md')
         shutil.copyfile(ROOT / 'SDK_API_GUIDE.md', target / 'SDK_API_GUIDE.md')
     else:
-        (target / 'SDK_USAGE.md').write_text('''# Acquisition SDK 0.1.0
+        (target / 'SDK_USAGE.md').write_text(f'''# Acquisition SDK {version}
 
 Requires Windows x64, CPython 3.11 and the Python/native dependencies in requirements.txt.
 Dependencies are not bundled. The tested environment uses NumPy2.1.3, Open3D0.19.0,
