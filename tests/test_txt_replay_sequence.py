@@ -83,6 +83,19 @@ class TxtReplaySequenceTests(unittest.TestCase):
         self.assertEqual(10, worker.all_frames["left"][0][0, 0])
         self.assertEqual(110, worker.all_frames["right"][0][0, 0])
 
+    def test_bottom_txt_import_and_replay_use_the_configured_direction(self):
+        from acquisition_sdk._internal.pointcloud.PointCloudFileProcess import resolve_txt_files
+
+        self.write("left_2.txt", 20)
+        (self.root / "down_2.txt").write_text("-21 2000 0\n21 2000 0\n", encoding="utf-8")
+        (self.root / "right_down_2.txt").write_text("33 2000 0\n", encoding="utf-8")
+        files = resolve_txt_files(self.root, "right_down_2.txt")
+        self.assertEqual({"left_2.txt", "down_2.txt", "right_down_2.txt"}, {Path(path).name for path in files})
+        worker = self.worker("down_2.txt", same_origin=False)
+        worker._load_all_frames()
+        self.assertEqual(-21, worker.all_frames["left_down"][0][0, 0])
+        self.assertEqual(33, worker.all_frames["right_down"][0][0, 0])
+
     def test_same_origin_directory_accepts_plain_txt_without_counting_direction_files_twice(self):
         self.write("2.txt", 2)
         self.write("10.txt", 10)

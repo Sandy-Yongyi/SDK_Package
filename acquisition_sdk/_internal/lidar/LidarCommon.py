@@ -52,10 +52,9 @@ class BaseLidar(ABC):
         self.start_angle = config["start_angle"]
         self.stop_angle = config["stop_angle"]
         self._socket: Optional[socket.socket] = None
-        self.lidar_status = 0  # 0=正常，1=有遮挡，2=异常需重启
+        self._scan_faulted = False  # 报文或设备故障后需要重启。
 
         read_data_config = TomlLoader.load(os.getcwd() + "\\model\\tomls\\ReadDataConfig.toml")
-        self.radius_num = read_data_config["radius_num"]
         self.radius_threshold = read_data_config["radius_threshold"]
         poll_timeout_ms = float(read_data_config.get("socket_recv_poll_timeout_ms", 50))
         max_attempts = int(read_data_config.get("socket_recv_max_attempts", 3))
@@ -86,19 +85,19 @@ class BaseLidar(ABC):
             self._socket.close()
             self._socket = None
 
-    def scan(self):
+    def scan(self) -> tuple[LidarData, int, bool]:
+        """返回点云、近距离点数和本次扫描的设备故障标记。"""
         raw_data = self._read_data()
         if not raw_data:
-            self.lidar_status = 2
             logger.error(f"Lidar {self.id} returned empty raw data")
+        parsed = self._parse_data(raw_data) if raw_data else None
+        if parsed is None or self._scan_faulted:
+            self._scan_faulted = True
             empty = np.array([], dtype=float)
             empty_points = np.empty((0, 2), dtype=float)
-            return LidarData(self.id, empty, empty, empty_points, empty_points), self.lidar_status
+            return LidarData(self.id, empty, empty, empty_points, empty_points), 0, True
 
-        radius, angles = self._parse_data(raw_data)
-        if self.lidar_status == 2:
-            empty_points = np.empty((0, 2), dtype=float)
-            return LidarData(self.id, radius, angles, empty_points, empty_points), self.lidar_status
+        radius, angles = parsed
 
         # 根据开始角度和结束角度来截取数据（仅type=120需要）
         if self.lidar_type == "120":
@@ -106,14 +105,13 @@ class BaseLidar(ABC):
             angles = angles[mask]
             radius = radius[mask]
 
-        r_num = np.sum((radius > 0) & (radius < self.radius_threshold))
-        self.lidar_status = 1 if r_num > self.radius_num else 0
+        occlusion_count = int(np.count_nonzero((radius > 0) & (radius < self.radius_threshold)))
 
         radian = angles * np.pi / 180.0
         same_cartesian = self._to_cartesian_same_origin(radius, radian)
         diff_cartesian = self._to_cartesian_diff_origin(radius, radian)
 
-        return LidarData(self.id, radius, angles, same_cartesian, diff_cartesian), self.lidar_status
+        return LidarData(self.id, radius, angles, same_cartesian, diff_cartesian), occlusion_count, False
 
     def _read_data(self) -> bytes:
         if self._socket is None:
@@ -149,7 +147,7 @@ class BaseLidar(ABC):
         finally:
             active_socket.settimeout(previous_timeout)
 
-    def _parse_data(self, raw: bytes) -> tuple[np.ndarray, np.ndarray]:
+    def _parse_data(self, raw: bytes) -> tuple[np.ndarray, np.ndarray] | None:
         """解析数据"""
         try:
             data_str = raw[raw.find(b"\x02sRA") + 1: raw.find(b"\x03")].decode()
@@ -158,8 +156,7 @@ class BaseLidar(ABC):
 
             if not self._check_error_status(error_status):
                 logger.error('lidar error, now restart')
-                self.lidar_status = 2
-                return np.array([], dtype=float), np.array([], dtype=float)
+                return None
 
             dist_index = parts.index("DIST1")
             start_angle = self._get_start_angle(parts, dist_index)
@@ -171,9 +168,8 @@ class BaseLidar(ABC):
 
             return radius, angles
         except Exception as e:
-            self.lidar_status = 2
             logger.error(f"Parse data error: {str(e)}")
-            return np.array([], dtype=float), np.array([], dtype=float)
+            return None
 
     @abstractmethod
     def _check_error_status(self, error_status: str) -> bool:
@@ -212,7 +208,7 @@ class BaseLidar(ABC):
                 y = radius * np.cos(angles) + self.diff_origin_offset_y
             elif self.install_orietation == "down":
                 x = radius * np.cos(angles) + self.diff_origin_offset_x
-                y = -(radius * np.sin(angles)) + self.diff_origin_offset_y
+                y = radius * np.sin(angles) + self.diff_origin_offset_y
             elif self.install_orietation == "left_upper":
                 x = radius * np.cos(angles) + self.diff_origin_offset_x
                 y = -(radius * np.sin(angles)) + self.diff_origin_offset_y

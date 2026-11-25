@@ -1,4 +1,5 @@
 import numpy as np
+from model.utils.LidarDirectionUtil import SPLIT_BOTTOM_DIRECTIONS
 
 
 class LidarDirectionState:
@@ -10,15 +11,18 @@ class LidarDirectionState:
         self.scanning_started = False
         self.has_scanned = False
         self.start_pulse = None
-        self.stop_pulse = None
+        self.stop_pulse: int | None = None
         self.frame_counts = []
         self.xyz_data = np.empty((0, 3))
-        self.stop_reason = None        # "points" / "max_length" / "linked"
+        self.stop_reason: str | None = None        # "points" / "max_length" / "linked"
         self.is_link_anchor = False
         self.last_diff_origin_filtered = np.empty((0, 3))
         self.last_same_origin_filtered = np.empty((0, 3))
         # 方向特定阈值
-        self.points_threshold = config[f"{direction}_scan_points_threshold"]
+        threshold_key = f"{direction}_scan_points_threshold"
+        if direction in SPLIT_BOTTOM_DIRECTIONS and threshold_key not in config:
+            threshold_key = "down_scan_points_threshold"
+        self.points_threshold = config[threshold_key]
 
     def should_start_scanning(self, frame_counts):
         """判断是否应该开始扫描"""

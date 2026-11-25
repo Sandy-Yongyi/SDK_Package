@@ -5,6 +5,7 @@ import multiprocessing
 from acquisition_sdk import DataFindBlocks
 from acquisition_sdk import BlockData
 from model.utils.TomlLoader import TomlLoader
+from model.utils.LidarDirectionUtil import SIDE_DIRECTIONS
 from model.utils.WorkpieceOriginUtil import get_origin_side, transform_points_for_origin
 from model.utils.LoggerUtil import logger
 from model.utils.LoggerUtil import check_and_rotate_log
@@ -62,9 +63,10 @@ class DataProcessingProcess(multiprocessing.Process):
         result = {}
         lidar_status = int(raw_data.get("lidar_status", 0))
         result["lidar_status"] = lidar_status
+        if "lidar_occlusion_counts" in raw_data:
+            result["lidar_occlusion_counts"] = raw_data["lidar_occlusion_counts"]
         translate_data_origin = int(raw_data.get("translate_data_origin", 1 if "all_data" in raw_data else 2) or 2)
 
-        directions = {"left", "right"}
         if translate_data_origin == 1:
             all_data = raw_data.get("all_data")
             if self._has_valid_points(all_data):
@@ -73,11 +75,11 @@ class DataProcessingProcess(multiprocessing.Process):
                 if isinstance(block_data, BlockData):
                     self._push_visualization_data(all_data, block_data)
                     target_directions = [
-                        direction for direction in sorted(directions)
+                        direction for direction in SIDE_DIRECTIONS
                         if f"{direction}_stop_pulse" in raw_data
                     ]
                     if not target_directions:
-                        target_directions = sorted(directions)
+                        target_directions = SIDE_DIRECTIONS
 
                     default_stop_pulse = raw_data.get("all_stop_pulse", 0)
                     for direction in target_directions:
@@ -91,7 +93,7 @@ class DataProcessingProcess(multiprocessing.Process):
             return
 
         # 按方向处理
-        for idx, direction in enumerate(sorted(directions), start=1):
+        for idx, direction in enumerate(SIDE_DIRECTIONS, start=1):
             stop_pulse = raw_data.get(f"{direction}_stop_pulse", 0)
             data = raw_data.get(f"{direction}_data")
 

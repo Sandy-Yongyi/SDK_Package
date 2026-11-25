@@ -1,21 +1,22 @@
 import copy
-from typing import Any, Callable, Dict, List
+from typing import Any, Dict, List
 from model.utils.LoggerUtil import logger
 from model.utils.StrategyUtil import is_complete_workpiece_mode, is_continuous_bidirectional_mode, validate_strategy_name
 from model.utils.TomlLoader import TomlLoader
-from model.utils.LidarDirectionUtil import SIDE_DIRECTIONS, UPPER_DIRECTIONS, get_active_lidar_config
+from model.utils.LidarDirectionUtil import (SPLIT_BOTTOM_DIRECTIONS, X_AXIS_DIRECTIONS, get_active_directions,
+                                           get_point_cloud_directions, get_split_bottom_x_grid)
 from acquisition_sdk._internal.formats.frame_by_frame.AxisFrameDataFormat import AxisFrameData, AxisData
 
 
 class FrameQueueManager:
     """
-    激光数据帧队列管理器（left / right / left_upper / right_upper）
+    激光数据帧队列管理器
     功能：
         - frame_by_frame:
-            - 根据 SystemConfig.toml 自动创建方向（left / right / left_upper / right_upper）
+            - 根据 SystemConfig.toml 自动创建已配置的激光方向
             - 每个方向一个固定长度 FIFO 队列
             - left / right 按 Y 轴范围初始化全零帧
-            - left_upper / right_upper 按 X 轴范围初始化全零帧
+            - left_upper / right_upper / down 按 X 轴范围初始化全零帧
         - complete_workpiece:
             - 根据 machine_config 的安装方向动态创建方向队列
             - 每个方向下按设备 sn 建立固定长度的工件队列，初始值为 None
@@ -24,14 +25,10 @@ class FrameQueueManager:
             - 到位搬移、放行完成清理，不使用设备SN或链条FIFO移位
     """
 
-    # 侧面方向（使用 Y 轴范围）
-    _SIDE_DIRECTIONS = SIDE_DIRECTIONS
-    # 顶面方向（使用 X 轴范围）
-    _UPPER_DIRECTIONS = UPPER_DIRECTIONS
-
     def __init__(self, system_config_path: str, stack_size: int = 1500, y_min: int = 1100, y_max: int = 3800,
                  y_threshold: int = 10, x_min: int = 0, x_max: int = 900, x_threshold: int = 10,
-                 strategy_name: str = "frame_by_frame", machine_config: dict | None = None):
+                 strategy_name: str = "frame_by_frame", machine_config: dict | None = None,
+                 read_data_config: dict | None = None):
         self.system_config_path = system_config_path
         self.stack_size = stack_size
         self.y_min = y_min
@@ -42,6 +39,7 @@ class FrameQueueManager:
         self.x_threshold = x_threshold
         self.strategy_name = validate_strategy_name(strategy_name)
         self.machine_config = machine_config or {}
+        self.read_data_config = read_data_config or {}
         self.frame_stack: Dict[str, List[Any]] = {}
         self.queues: Dict[str, Dict[int, List[Any]]] = {}
         self.active_directions = ()
@@ -61,7 +59,9 @@ class FrameQueueManager:
     def _initialize_continuous_stacks(self):
         """每个激光方向固定三个原始点云位：激光、手补、自动。"""
         system_cfg = TomlLoader.load(self.system_config_path)
-        self.active_directions = tuple(get_active_lidar_config(system_cfg))
+        self.active_directions = tuple(get_point_cloud_directions(
+            get_active_directions(system_cfg), self.read_data_config.get("translate_data_origin", 1)
+        ))
         if not self.active_directions:
             raise ValueError("No lidar directions configured for continuous mode.")
         self.stack_size = 3
@@ -141,12 +141,12 @@ class FrameQueueManager:
             logger.error(f"Failed to load SystemConfig.toml: {e}")
             return
 
-        active_lidar_config = get_active_lidar_config(system_cfg)
-        self.active_directions = tuple(active_lidar_config.keys())
+        self.active_directions = tuple(get_point_cloud_directions(
+            get_active_directions(system_cfg), self.read_data_config.get("translate_data_origin", 1)
+        ))
 
         for direction in self.active_directions:
-            creator = self.create_empty_frame_x if direction in self._UPPER_DIRECTIONS else self.create_empty_frame_y
-            self.frame_stack[direction] = self._create_empty_stack(creator)
+            self.frame_stack[direction] = self._create_empty_stack(direction)
 
         if not self.frame_stack:
             logger.warning("SystemConfig.toml has no lidar directions; no stacks created.")
@@ -170,9 +170,16 @@ class FrameQueueManager:
         if not self.queues:
             logger.warning("machine_config has no valid orientations; no complete_workpiece queues created.")
 
-    def _create_empty_stack(self, frame_creator: Callable) -> List[AxisFrameData]:
+    def _create_empty_stack(self, direction: str) -> List[AxisFrameData]:
         """生成一个 stack_size 长度的空 AxisFrameData 队列"""
-        return [frame_creator() for _ in range(self.stack_size)]
+        return [self.create_empty_frame_for_direction(direction) for _ in range(self.stack_size)]
+
+    def create_empty_frame_for_direction(self, direction: str) -> AxisFrameData:
+        if direction in SPLIT_BOTTOM_DIRECTIONS:
+            return self.create_empty_frame_x(get_split_bottom_x_grid(self.read_data_config))
+        if direction in X_AXIS_DIRECTIONS:
+            return self.create_empty_frame_x()
+        return self.create_empty_frame_y()
 
     def create_empty_frame_y(self) -> AxisFrameData:
         """
@@ -183,13 +190,14 @@ class FrameQueueManager:
         frame_list = [AxisData(H_Axis=0, V_Axis_Max=0, V_Axis_Min=0) for _ in range(self.y_min, self.y_max, self.y_threshold)]
         return AxisFrameData(FrameData=frame_list)
 
-    def create_empty_frame_x(self) -> AxisFrameData:
+    def create_empty_frame_x(self, grid: tuple[int, int, int] | None = None) -> AxisFrameData:
         """
-        创建空 AxisFrameData（X 轴范围，用于 left_upper / right_upper）：
+        创建空 AxisFrameData（X 轴范围，用于 left_upper / right_upper / down）：
         - 按 x_min ~ x_max, x_threshold 步长生成行
         - 所有值初始化为 0
         """
-        frame_list = [AxisData(H_Axis=0, V_Axis_Max=0, V_Axis_Min=0) for _ in range(self.x_min, self.x_max, self.x_threshold)]
+        x_min, x_max, threshold = grid if grid is not None else (self.x_min, self.x_max, self.x_threshold)
+        frame_list = [AxisData(H_Axis=0, V_Axis_Max=0, V_Axis_Min=0) for _ in range(x_min, x_max, threshold)]
         return AxisFrameData(FrameData=frame_list)
 
     def create_empty_frame(self) -> AxisFrameData:
@@ -299,11 +307,7 @@ class FrameQueueManager:
             return
 
         if direction in self.frame_stack:
-            if direction in self._UPPER_DIRECTIONS:
-                creator = self.create_empty_frame_x
-            else:
-                creator = self.create_empty_frame_y
-            self.frame_stack[direction] = self._create_empty_stack(creator)
+            self.frame_stack[direction] = self._create_empty_stack(direction)
 
     def clear_workpieces(self, direction: str):
         """清空 complete_workpiece 模式的某个方向工件队列。"""

@@ -10,7 +10,8 @@ from acquisition_sdk import DataSplitting
 from model.utils.LoggerUtil import logger
 from model.utils.TomlLoader import TomlLoader
 from model.utils.FrameFifoConfig import get_frame_fifo_step_mm
-from model.utils.LidarDirectionUtil import ALL_DIRECTIONS, get_active_directions
+from model.utils.LidarDirectionUtil import (POINT_CLOUD_DIRECTIONS, SPLIT_BOTTOM_DIRECTIONS, get_active_directions,
+                                            get_lidar_filter_bounds, get_point_cloud_directions)
 from model.utils.StrategyUtil import is_complete_workpiece_mode, is_frame_by_frame_mode, validate_strategy_name
 from model.utils.WorkpieceOriginUtil import get_origin_side, transform_points_for_origin
 from acquisition_sdk import build_side_frame
@@ -19,7 +20,7 @@ from model.utils.ProcessHeartbeat import ProcessHeartbeat
 
 # 调试数据处理
 class DataProcessWorker(multiprocessing.Process):
-    DIRECTIONS = ALL_DIRECTIONS
+    DIRECTIONS = POINT_CLOUD_DIRECTIONS
 
     def __init__(self, machine_data_queue, pulse_queue, viz_queue, data_paths, data_name=None,
                  strategy_name="frame_by_frame", config_dir=None, heartbeat=None, heartbeat_interval_s: float = 1.0):
@@ -42,7 +43,9 @@ class DataProcessWorker(multiprocessing.Process):
         self.system_config = TomlLoader.load(f"{self.config_dir}\\SystemConfig.toml")
         self.draw_type = int(self.read_data_config.get("draw_type", 1))
         self.translate_data_origin = int(self.read_data_config.get("translate_data_origin", 1) or 1)
-        self.directions = tuple(get_active_directions(self.system_config))
+        self.directions = tuple(get_point_cloud_directions(
+            get_active_directions(self.system_config), self.translate_data_origin
+        ))
         # 存储所有帧数据
         self.all_frames = {}
         self.current_frame_index = 0
@@ -167,6 +170,8 @@ class DataProcessWorker(multiprocessing.Process):
     def _get_point_cloud_sources(self):
         if self._uses_same_origin():
             return ("combined",)
+        if "left_down" in self.directions:
+            return (*self.directions, "down")
         return tuple(self.directions)
 
     def _normalize_dataset_name(self, data_name):
@@ -251,9 +256,23 @@ class DataProcessWorker(multiprocessing.Process):
 
     def _load_dataset_points(self, dataset):
         points_by_source = {}
+        legacy_bottom = None
+        split_bottom = "left_down" in self.directions
+        if split_bottom and "down" in dataset["paths"] and not all(
+            direction in dataset["paths"] for direction in SPLIT_BOTTOM_DIRECTIONS
+        ):
+            with self._heartbeat_guard():
+                legacy_bottom = self._safe_load_points(dataset["paths"]["down"])
         for source in self._get_point_cloud_sources():
+            if source == "down" and split_bottom:
+                continue
             path = dataset["paths"].get(source)
             if not path:
+                if source in SPLIT_BOTTOM_DIRECTIONS and legacy_bottom is not None:
+                    x_min, x_max, y_min, y_max = get_lidar_filter_bounds(self.read_data_config, source)
+                    x, y = legacy_bottom[:, 0], legacy_bottom[:, 1]
+                    points_by_source[source] = legacy_bottom[(x_min <= x) & (x <= x_max) & (y_min <= y) & (y <= y_max)]
+                    continue
                 logger.warning(
                     f"Dataset '{dataset['name']}' has no {source}_ point cloud file"
                 )

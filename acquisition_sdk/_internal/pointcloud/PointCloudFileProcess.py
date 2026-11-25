@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
+from model.utils.LidarDirectionUtil import POINT_CLOUD_DIRECTIONS
 from model.utils.ProcessHeartbeat import ProcessHeartbeat
 from model.utils.UiTelemetry import UiStatusPublisher
 from model.utils.WorkpieceOriginUtil import transform_points_for_origin
@@ -20,13 +21,14 @@ def resolve_txt_files(data_path, data_name=None) -> tuple[str, ...]:
         files = sorted(p for p in path.iterdir() if p.is_file() and p.suffix.casefold() == ".txt")
         if data_name:
             name = Path(data_name).name.casefold()
-            for prefix in ("combined_", "left_upper_", "right_upper_", "left_", "right_"):
+            prefixes = ("combined_", *(f"{direction}_" for direction in sorted(POINT_CLOUD_DIRECTIONS, key=len, reverse=True)))
+            for prefix in prefixes:
                 if name.startswith(prefix):
                     name = name[len(prefix):]
                     break
             if not name.endswith(".txt"):
                 name += ".txt"
-            names = {name} | {prefix + name for prefix in ("combined_", "left_", "right_", "left_upper_", "right_upper_")}
+            names = {name} | {prefix + name for prefix in prefixes}
             files = [p for p in files if p.name.casefold() in names]
     else:
         raise FileNotFoundError(f"点云路径不存在：{path}")

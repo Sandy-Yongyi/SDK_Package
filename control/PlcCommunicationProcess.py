@@ -11,6 +11,7 @@ from model.utils.LoggerUtil import check_and_rotate_log, logger
 from acquisition_sdk import PlcManager
 from model.utils.TomlLoader import TomlLoader
 from model.utils.FrameFifoConfig import get_frame_fifo_step_mm
+from model.utils.LidarDirectionUtil import LIDAR_LIST_COUNT
 from model.MovingFrameData import ReceiveMovingFrameData, SendMovingFrameData
 from acquisition_sdk import FrameQueueManager
 from acquisition_sdk import BlockData
@@ -86,6 +87,7 @@ class PlcCommunicationProcess(multiprocessing.Process):
         self.pulse_history = []
         self.chain_motion_status = "stopped"
         self.lidar_status = 0
+        self.lidar_occlusion_counts = [0] * LIDAR_LIST_COUNT
         self.lidar_recovered = False
         self.lidar_fault_return_pending = False
         self.lidar_recovery_required = False
@@ -324,6 +326,7 @@ class PlcCommunicationProcess(multiprocessing.Process):
             x_threshold=x_threshold,
             strategy_name=self.strategy_name,
             machine_config=self.machine_config,
+            read_data_config=self.read_data_config,
         )
 
     def _initialize_connection(self):
@@ -531,11 +534,25 @@ class PlcCommunicationProcess(multiprocessing.Process):
             "status": status,
             "plc_generation": self.plc_connection_generation,
             "lidar_recovery": self._lidar_recovery_request,
+            "lidar_occluded": self.lidar_status == 1,
         })
 
+    def _lidar_status_from_packet(self, packet: dict) -> int | None:
+        counts = packet.get("lidar_occlusion_counts")
+        if counts is None and "lidar_status" not in packet:
+            return None
+
+        status = int(packet.get("lidar_status", 0) or 0)
+        if counts is not None:
+            self.lidar_occlusion_counts = counts
+            if status == 0 and max(counts) > self.read_data_config["radius_num"]:
+                status = 1
+        return status
+
     def _update_lidar_status_from_packet(self, fifo_data: dict):
-        if "lidar_status" in fifo_data:
-            self._update_lidar_status(int(fifo_data.get("lidar_status", 0) or 0))
+        status = self._lidar_status_from_packet(fifo_data)
+        if status is not None:
+            self._update_lidar_status(status)
 
     def _should_skip_raw_packet(self) -> bool:
         return self.lidar_status in (1, 2, 3) or self.lidar_fault_return_pending
@@ -623,8 +640,9 @@ class PlcCommunicationProcess(multiprocessing.Process):
                 break
             if not isinstance(packet, dict):
                 continue
-            if "lidar_status" in packet:
-                self.lidar_status = int(packet["lidar_status"])
+            status = self._lidar_status_from_packet(packet)
+            if status is not None:
+                self.lidar_status = status
                 self.continuous_lidar_ready = True
                 # 遮挡和设备严重异常锁存；断线允许恢复后反向重采。
                 if self.lidar_status in (1, 2):
@@ -673,8 +691,7 @@ class PlcCommunicationProcess(multiprocessing.Process):
                 if not isinstance(machine_data, dict):
                     continue
 
-                if "lidar_status" in machine_data:
-                    self._update_lidar_status(int(machine_data.get("lidar_status", 0) or 0))
+                self._update_lidar_status_from_packet(machine_data)
                 if self._should_skip_raw_packet():
                     continue
 
@@ -745,7 +762,7 @@ class PlcCommunicationProcess(multiprocessing.Process):
             return
 
         for direction in tuple(self.frame_queue_manager.frame_stack.keys()):
-            empty_frame = self.frame_queue_manager.create_empty_frame_x() if direction in ("left_upper", "right_upper") else self.frame_queue_manager.create_empty_frame_y()
+            empty_frame = self.frame_queue_manager.create_empty_frame_for_direction(direction)
             self.frame_queue_manager.push_frame(direction, empty_frame, repeat_count=repeat_count)
 
     def _sync_frame_queue_with_chain_fifo(self):
@@ -837,7 +854,7 @@ class PlcCommunicationProcess(multiprocessing.Process):
 
                     block_data = frame_item.get("data")
                     stop_pulse = float(frame_item.get("stop_pulse", 0) or 0)
-                    if not isinstance(block_data, BlockData):
+                    if block_data is None or not isinstance(block_data, BlockData):
                         continue
 
                     prev_mm = prev_mm_map.get(frame_idx)

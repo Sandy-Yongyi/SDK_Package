@@ -5,9 +5,189 @@ import unittest
 
 import numpy as np
 
+from acquisition_sdk._internal.lidar.LidarCommon import LidarSick120
 from acquisition_sdk._internal.lidar.LidarAcquisitionProcess import LidarAcquisitionProcess
 from acquisition_sdk._internal.dataprocess.DataSplitting import DataSplitting
 from acquisition_sdk._internal.pointcloud.PointCloudSaveBuffer import PointCloudSaveBuffer, SharedPointCloudPool, read_blocks
+
+
+class LidarOcclusionTests(unittest.TestCase):
+    def test_scan_returns_cropped_occlusion_count_and_separate_fault(self):
+        from unittest.mock import Mock
+
+        lidar = LidarSick120.__new__(LidarSick120)
+        lidar.id = '9'
+        lidar.lidar_type = '120'
+        lidar.start_angle, lidar.stop_angle = 0, 90
+        lidar.radius_threshold = 100
+        lidar._scan_faulted = False
+        lidar._read_data = Mock(return_value=b'scan')
+        lidar._parse_data = Mock(return_value=(np.array([10, 0, 5, 100, 50]), np.array([-1, 0, 45, 90, 91])))
+        lidar._to_cartesian_same_origin = lidar._to_cartesian_diff_origin = Mock(return_value=np.empty((0, 2)))
+
+        data, count, failed = lidar.scan()
+        np.testing.assert_array_equal(data.radius, [0, 5, 100])
+        self.assertEqual(1, count)
+        self.assertFalse(failed)
+
+        lidar._read_data.return_value = b''
+        _, count, failed = lidar.scan()
+        self.assertEqual(0, count)
+        self.assertTrue(failed)
+
+        lidar._read_data.return_value = b'scan'
+        _, count, failed = lidar.scan()
+        self.assertEqual(0, count)
+        self.assertTrue(failed)
+
+    def test_bottom_lidar_count_reaches_pc_plc_process_through_workpiece_processing(self):
+        from unittest.mock import Mock, patch
+
+        from acquisition_sdk._internal.dataprocess.DataFilter import DataFilter
+        from acquisition_sdk._internal.lidar.LidarCommon import LidarData
+        from control.DataProcessingProcess import DataProcessingProcess
+        from control.PlcCommunicationProcess import PlcCommunicationProcess
+
+        raw, machine = queue.Queue(), queue.Queue()
+        from model.utils.TomlLoader import TomlLoader
+
+        original_load = TomlLoader.load
+
+        def load_with_shared_origin(path):
+            config = original_load(path)
+            if path.endswith("ReadDataConfig.toml"):
+                config["translate_data_origin"] = 1
+            return config
+
+        with patch.object(TomlLoader, "load", side_effect=load_with_shared_origin):
+            acq = LidarAcquisitionProcess(queue.Queue(), raw, queue.Queue(), {"down": ["9"]}, "model\\tomls", strategy_name="complete_workpiece")
+        lidar = Mock()
+        empty = np.empty((0, 2))
+        data = LidarData("9", np.array([200]), np.array([0]), np.array([[1500, 2000]]), empty)
+        empty_data = LidarData("9", np.array([]), np.array([]), empty, empty)
+        lidar.scan.side_effect = [(data, 101, False), (empty_data, 0, True), (empty_data, 0, False)]
+        acq.lidar_manager = Mock()
+        acq.lidar_manager.get_lidar.return_value = lidar
+        acq.data_filter = DataFilter()
+        acq.data_split = DataSplitting()
+        acq.strategy = Mock()
+        processor = DataProcessingProcess.__new__(DataProcessingProcess)
+        processor.machine_data_queue = machine
+        plc = PlcCommunicationProcess(raw, queue.Queue(), queue.Queue(), machine_data_queue=machine,
+                                      strategy_name="complete_workpiece")
+        plc.read_data_config["radius_num"] = 100
+        plc.frame_queue_manager = Mock()
+
+        for sample, status, count in ((acq._capture_frame, 1, 101), (acq._poll_lidar_status_if_due, 2, 101),
+                                      (lambda: acq._poll_lidar_status_if_due(force=True), 0, 0)):
+            sample()
+            processor._process_data(raw.get_nowait())
+            plc._process_workpiece_data()
+            self.assertEqual(status, plc.lidar_status)
+            self.assertEqual([0] * 8 + [count], plc.lidar_occlusion_counts)
+
+        self.assertEqual([("9",)] * 3, [call.args for call in acq.lidar_manager.get_lidar.call_args_list])
+        self.assertEqual(["down"], acq.active_directions)
+        np.testing.assert_array_equal(acq.direction_states["down"].last_same_origin_filtered[:, :2], [[1500, 2000]])
+        self.assertEqual(0, acq.direction_states["down"].last_diff_origin_filtered.size)
+        acq.direction_states["down"].scanning_started = True
+        acq.save_buffer = Mock(free_blocks=10, descriptor={"block_count": 10})
+        acq._save_valid_data_core(40)
+        direction, saved = acq.save_buffer.append.call_args_list[0].args
+        self.assertEqual("down", direction)
+        np.testing.assert_array_equal(saved, [[1500, 2000, 40]])
+
+    def test_bottom_lidar_uses_x_layers_for_live_frames_and_fifo_fill(self):
+        from unittest.mock import patch
+
+        from acquisition_sdk import FrameQueueManager
+        from acquisition_sdk._internal.dataprocess.frame_by_frame.BuildSideFrame import build_side_frame
+        from control.PlcCommunicationProcess import PlcCommunicationProcess
+        from model.utils.LidarDirectionUtil import SIDE_DIRECTIONS, get_active_directions
+
+        system = {"left_lidar_ids": ["1"], "left_upper_lidar_ids": ["7"], "down_lidar_ids": ["9"]}
+        self.assertEqual(["left", "left_upper", "down"], get_active_directions(system))
+        self.assertEqual(["left"], get_active_directions(system, SIDE_DIRECTIONS))
+        with patch("acquisition_sdk._internal.formats.FrameQueueManager.TomlLoader.load", return_value=system):
+            manager = FrameQueueManager("SystemConfig.toml", stack_size=2, x_min=10, x_max=30, x_threshold=10,
+                                        y_min=100, y_max=130, y_threshold=10)
+
+        self.assertEqual(2, len(manager.frame_stack["down"][0].FrameData))
+        points = np.array([[11, 120], [19, 150]])
+        config = {"combined_x_min": 10, "combined_x_max": 30, "x_threshold": 10}
+        frame = build_side_frame({"down": [points]}, "down", config)
+        self.assertEqual([(10, 150, 120), (0, 0, 0)],
+                         [(row.H_Axis, row.V_Axis_Max, row.V_Axis_Min) for row in frame.FrameData])
+        manager.push_frame("down", frame)
+        plc = PlcCommunicationProcess(queue.Queue(), queue.Queue(), queue.Queue())
+        plc.frame_queue_manager = manager
+        plc._push_empty_frames(1)
+        self.assertEqual(2, len(manager.frame_stack["down"][0].FrameData))
+        self.assertIs(frame, manager.frame_stack["down"][1])
+        self.assertEqual(3, len(manager.frame_stack["left"][0].FrameData))
+        manager.clear("down")
+        self.assertEqual([2, 2], [len(frame.FrameData) for frame in manager.frame_stack["down"]])
+
+    def test_independent_origin_splits_one_bottom_scan_and_keeps_shared_frame_grid(self):
+        from unittest.mock import Mock, patch
+
+        from acquisition_sdk import DataFilter, FrameQueueManager
+        from acquisition_sdk._internal.lidar.LidarCommon import LidarData
+        from acquisition_sdk._internal.lidar.LidarAcquisitionStrategies import AcquisitionStrategyFactory
+        from control.PlcCommunicationProcess import PlcCommunicationProcess
+        from model.utils.TomlLoader import TomlLoader
+
+        config = TomlLoader.load("model/tomls/ReadDataConfig.toml")
+        config.update(translate_data_origin=2, x_threshold=5, left_down_x_min=-20, left_down_x_max=0,
+                      right_down_x_min=-10, right_down_x_max=10, left_down_y_min=1100,
+                      left_down_y_max=2300, right_down_y_min=1800, right_down_y_max=2600)
+        original_load = TomlLoader.load
+        with patch.object(TomlLoader, "load", side_effect=lambda path: config if path.endswith("ReadDataConfig.toml") else original_load(path)):
+            raw = queue.Queue()
+            acq = LidarAcquisitionProcess(queue.Queue(), raw, queue.Queue(), {"down": ["9"]}, "model\\tomls")
+        local = np.array([[-20, 1200], [-10, 2200], [10, 2400], [0, 1500]])
+        common = local + [1500, 0]
+        acq.data_filter = DataFilter()
+        acq.strategy = Mock()
+        acq.lidar_manager = Mock()
+        scanner = acq.lidar_manager.get_lidar.return_value
+        scanner.scan.return_value = (LidarData("9", np.ones(4), np.zeros(4), common, local), 7, False)
+
+        acq._capture_frame()
+        scanner.scan.assert_called_once_with()
+        self.assertEqual(["left_down", "right_down"], acq.active_directions)
+        np.testing.assert_array_equal(acq.direction_states["left_down"].last_diff_origin_filtered, local[[0, 1, 3]])
+        np.testing.assert_array_equal(acq.direction_states["right_down"].last_diff_origin_filtered, local[[1, 2]])
+        self.assertEqual([0] * 8 + [7], raw.get_nowait()["lidar_occlusion_counts"])
+
+        with patch.object(TomlLoader, "load", return_value={"down_lidar_ids": ["9"]}):
+            manager = FrameQueueManager("SystemConfig.toml", stack_size=2, read_data_config=config)
+        acq.cm_accum[2] = {direction: [state.last_diff_origin_filtered] for direction, state in acq.direction_states.items()}
+        acq._send_single_fifo(2, 2)
+        packet = raw.get_nowait()
+        plc = PlcCommunicationProcess(queue.Queue(), queue.Queue(), queue.Queue())
+        plc.frame_queue_manager = manager
+        for direction in manager.active_directions:
+            manager.push_frame(direction, packet[direction])
+        plc._push_empty_frames(1)
+        self.assertEqual([7, 7], [len(frame.FrameData) for frame in manager.frame_stack["right_down"]])
+        self.assertEqual(2400, manager.frame_stack["right_down"][1].FrameData[-1].V_Axis_Max)
+        manager.clear("left_down")
+        self.assertEqual([7, 7], [len(frame.FrameData) for frame in manager.frame_stack["left_down"]])
+
+        acq.data_split = DataSplitting()
+        acq.save_buffer = Mock(free_blocks=10, descriptor={"block_count": 10})
+        for state in acq.direction_states.values():
+            state.scanning_started = True
+        acq._save_valid_data_core(40)
+        self.assertEqual(["left_down", "right_down", "combined"], [call.args[0] for call in acq.save_buffer.append.call_args_list])
+        for name in ("complete_workpiece", "continuous_bidirectional"):
+            for state in acq.direction_states.values():
+                state.xyz_data = np.column_stack((state.last_diff_origin_filtered, np.zeros(len(state.last_diff_origin_filtered))))
+            AcquisitionStrategyFactory.create_strategy(name, config).send_raw_data(acq)
+            packet = raw.get_nowait()
+            self.assertEqual(3, len(packet["left_down_data"]))
+            self.assertEqual(2, len(packet["right_down_data"]))
 
 
 class AcquisitionSavingTests(unittest.TestCase):
@@ -88,6 +268,7 @@ class AcquisitionSavingTests(unittest.TestCase):
         self.process.stop_event = mp.get_context("spawn").Event()
         self.process.shutdown_flag = False
         self.process.plc_connection_generation = 7
+        self.process.lidar_occlusion_counts = [0] * 9
         self.process.strategy_name = "frame_by_frame"
         self.process.read_data_config = {"translate_data_origin": 0, "y_threshold": 10,
                                          "max_pulse": 100, "pulse_to_mm": 1}
@@ -195,6 +376,7 @@ class AcquisitionSavingTests(unittest.TestCase):
         self.process.active_directions = ["left"]
         self.process.build_side_frame = build_side_frame
         self.process.lidar_status = 0
+        self.process.lidar_occlusion_counts[8] = 42
         self.process.read_data_config.update(combined_y_min=0, combined_y_max=500)
         for fifo in (10, 11, 12):
             self.process.current_fifo = fifo
@@ -205,6 +387,7 @@ class AcquisitionSavingTests(unittest.TestCase):
             self.assertEqual(message["fifo"], fifo)
             self.assertEqual(message["repeat_count"], 1)
             self.assertEqual(message["lidar_status"], 0)
+            self.assertEqual(message["lidar_occlusion_counts"], [0] * 8 + [42])
             self.assertEqual(message["plc_generation"], 7)
             self.assertEqual(len(message["left"].FrameData), 50)
 

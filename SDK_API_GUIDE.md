@@ -1,4 +1,4 @@
-# Acquisition SDK 0.1.2 接口使用说明
+# Acquisition SDK 0.2.0 接口使用说明
 
 本文对应开发发布包中的 `acquisition_sdk.pyi`（Python 3.11、Windows x64）。`.pyi` 是类型提示文件，实际执行的是同目录的 `acquisition_sdk.cp311-win_amd64.pyd`；不是单独可运行的 SDK。示例从发布包目录运行，并保留包内 `model/` 和配置文件。`Any` 表示提示文件未限定类型，不能据此认为可以传入任意对象。
 
@@ -10,7 +10,7 @@
 
 | 名称 | 功能及输入 | 输出 |
 | --- | --- | --- |
-| `__version__` | SDK 版本常量，本版为字符串 `"0.1.2"`。 | `str` |
+| `__version__` | SDK 版本常量，本版为字符串 `"0.2.0"`。 | `str` |
 | `SDK_API_VERSION` | Python 接口版本常量，本版为 `1`。 | `int` |
 | `Int16()` | `typing.Annotated` 的有符号 16 位整数字段标记，无参数。 | 标记对象，占 2 字节。 |
 | `Int32()` | 有符号 32 位整数字段标记，无参数。 | 标记对象，占 4 字节。 |
@@ -58,7 +58,7 @@ assert offset == len(payload) == 302
 | `DataSplitting()` | 构造分割工具；本版精简 `.pyi` 没有提供其方法声明。 | 实例；不把未声明方法视作本交付接口。 |
 | `DataFindBlocks()` | 构造完整工件识别对象，从当前工作目录加载 `model/tomls/ProcessConfig.toml`。 | 实例。 |
 | `DataFindBlocks.start_process(point_cloud, lidar_status, data_dir)` | `point_cloud` 为 `N×3` XYZ NumPy 点云；`lidar_status` 是激光状态整数；`data_dir` 为方向编号。执行滤波、分层、工件分区和框体识别。 | 按配置 `send_data_type`：1 返回逐帧分区列表，其他值返回 `BlockData`；点数不足及处理内部异常均可能返回 `[]`，不能单靠空列表区分两者。 |
-| `build_side_frame(accum, side, process_config)` | `accum` 是方向名到点云数组列表的字典；`side` 为 `left`、`right`、`left_upper` 或 `right_upper`；`process_config` 是分层参数字典。侧面按 Y 分层统计 X 范围，顶部按 X 分层统计 Y 范围。 | `AxisFrameData`；无有效点的层为零。 |
+| `build_side_frame(accum, side, process_config)` | `accum` 是方向名到点云数组列表的字典；`side` 为 `left`、`right`、`left_upper`、`right_upper`、`down`、`left_down` 或 `right_down`；`process_config` 是分层参数字典。侧面按 Y 分层统计 X 范围，顶部和底部按 X 分层统计 Y 范围。 | `AxisFrameData`；无有效点的层为零。 |
 
 ```python
 import numpy as np
@@ -87,7 +87,11 @@ print(frame.FrameData)
 
 ## 帧和工件队列
 
-### `FrameQueueManager(system_config_path, stack_size=1500, y_min=1100, y_max=3800, y_threshold=10, x_min=0, x_max=900, x_threshold=10, strategy_name='frame_by_frame', machine_config=None)`
+### `FrameQueueManager(system_config_path, stack_size=1500, y_min=1100, y_max=3800, y_threshold=10, x_min=0, x_max=900, x_threshold=10, strategy_name='frame_by_frame', machine_config=None, read_data_config=None)`
+
+`read_data_config` 传入 `ReadDataConfig.toml` 的配置字典。独立原点模式下，底部激光对应 `left_down` 和 `right_down` 两个点云方向。
+`create_empty_frame_for_direction(direction)` 按对应方向创建空帧，左右底与实时建帧使用同一套 X 轴分层。
+
 
 输入分别为系统配置路径、队列长度、侧面 Y 和顶部 X 的分层起止范围及间隔、策略名称和设备配置字典。输出为队列管理对象；范围上限不包含在分层点中。策略为 `frame_by_frame`、`complete_workpiece` 或 `continuous_bidirectional`。完整工件策略按配置中的设备安装方向和 SN 建队列；连续策略按激光方向建立三个工位。
 
@@ -116,7 +120,7 @@ print(frame.FrameData)
 
 ### `resolve_txt_files(data_path, data_name=None)`
 
-`data_path` 为 TXT 文件或目录；可选 `data_name` 在目录中过滤工件文件，支持 `combined_`、`left_`、`right_`、`left_upper_`、`right_upper_` 前缀。返回绝对路径字符串元组；路径不存在抛 `FileNotFoundError`，没有匹配 TXT 抛 `ValueError`。
+`data_path` 为 TXT 文件或目录；可选 `data_name` 在目录中过滤工件文件，支持 `combined_`、`left_`、`right_`、`left_upper_`、`right_upper_`、`down_`、`left_down_`、`right_down_` 前缀。返回绝对路径字符串元组；路径不存在抛 `FileNotFoundError`，没有匹配 TXT 抛 `ValueError`。
 
 ### `PointCloudSaveService(config, output_dir, viz_queue=None)`
 

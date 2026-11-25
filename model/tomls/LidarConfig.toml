@@ -4,7 +4,7 @@ port = 2111                      # 激光雷达端口
 same_origin_offset_x = 0         # 相对同一原点偏移X,单位mm
 same_origin_offset_y = 3665      # 相对同一原点偏移Y,单位mm
 diff_origin_offset_x = 0         # 相对不同原点偏移X,单位mm(不同原点定义:左侧为左侧激光地面上,右侧为右侧激光地面上,上侧为左右原点的中心线地面上)
-diff_origin_offset_y = 3665      # 相对不同原点偏移Y,单位mm    
+diff_origin_offset_y = 3665      # 相对不同原点偏移Y,单位mm
 type = "120"                     # 激光型号
 install_orietation = "left"      # 激光安装方向
 start_angle_direction = 1        # 激光起始角度方向,0为0度在下方,1为0度在上方,2为0度朝右边,3为0度朝左边,都是面对激光正面逆时针0-180
@@ -75,3 +75,42 @@ install_orietation = "right"
 start_angle_direction = 1
 start_angle = 35
 stop_angle = 135
+
+[7]
+host = "192.168.1.207"
+port = 2111
+same_origin_offset_x = 3390
+same_origin_offset_y = 3800
+diff_origin_offset_x = 0
+diff_origin_offset_y = 3800
+type = "120"
+install_orietation = "left_upper"
+start_angle_direction = 0
+start_angle = 0
+stop_angle = 180
+
+[8]
+host = "192.168.1.208"
+port = 2111
+same_origin_offset_x = 3390
+same_origin_offset_y = 3800
+diff_origin_offset_x = 0
+diff_origin_offset_y = 3800
+type = "120"
+install_orietation = "right_upper"
+start_angle_direction = 1
+start_angle = 0
+stop_angle = 180
+
+[9]
+host = "192.168.1.209"
+port = 2111
+same_origin_offset_x = 3390
+same_origin_offset_y = 3800
+diff_origin_offset_x = 0
+diff_origin_offset_y = 3800
+type = "120"
+install_orietation = "down"
+start_angle_direction = 1
+start_angle = 0
+stop_angle = 180

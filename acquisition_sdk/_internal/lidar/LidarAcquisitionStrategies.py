@@ -10,6 +10,7 @@ import time
 import numpy as np
 from abc import ABC, abstractmethod
 from typing import Dict
+from model.utils.LidarDirectionUtil import SIDE_DIRECTIONS
 from model.utils.LoggerUtil import logger
 from model.utils.StrategyUtil import (COMPLETE_WORKPIECE_STRATEGY, CONTINUOUS_BIDIRECTIONAL_STRATEGY, FRAME_QUEUE_STRATEGY, validate_strategy_name,)
 
@@ -150,10 +151,10 @@ class ContinuousBidirectionalStrategy(AcquisitionStrategy):
             return
         # 直接向PLC进程发送整趟XYZ点云，不经过分区处理。
         same_origin = int(proc.read_data_config["translate_data_origin"]) == 1
-        raw_data = {"lidar_status": proc.lidar_status, "translate_data_origin": int(proc.read_data_config["translate_data_origin"]), }
-        directions = set(proc.lidar_config)
+        raw_data = {**proc._lidar_feedback_packet(), "translate_data_origin": int(proc.read_data_config["translate_data_origin"])}
+        directions = set(proc.direction_states)
         if same_origin:
-            directions.update(("left", "right"))
+            directions.update(SIDE_DIRECTIONS)
             raw_data["all_data"] = proc.all_xyz_data
             raw_data["all_stop_pulse"] = proc.current_pulse
         for direction in sorted(directions):
@@ -360,16 +361,11 @@ class CompleteWorkpieceStrategy(AcquisitionStrategy):
     def send_raw_data(self, proc):
         """发送完整工件数据（对应LidarAcquisitionProcess2的_send_raw_data）"""
         translate_data_origin = int(proc.read_data_config.get("translate_data_origin", 2) or 2)
-        raw_data = {"lidar_status": proc.lidar_status, "translate_data_origin": translate_data_origin, }
+        raw_data = {**proc._lidar_feedback_packet(), "translate_data_origin": translate_data_origin}
 
         direction_stop_pulses = {}
         valid_stop_pulses = []
-        for direction, lidar_ids in proc.lidar_config.items():
-            if not lidar_ids or len(lidar_ids) == 0:
-                continue
-            state = proc.direction_states.get(direction)
-            if not state:
-                continue
+        for direction, state in proc.direction_states.items():
             stop_pulse = getattr(state, "stop_pulse", None)
             direction_stop_pulses[direction] = stop_pulse
             # None表示该方向没有完成扫描；真实脉冲0必须作为有效停止脉冲保留。
@@ -394,14 +390,7 @@ class CompleteWorkpieceStrategy(AcquisitionStrategy):
             logger.info("Raw data sent to processing queue (same origin)")
             return
 
-        for direction, lidar_ids in proc.lidar_config.items():
-            if not lidar_ids or len(lidar_ids) == 0:
-                logger.debug(f"Skip sending data for direction '{direction}' (no lidar configured)")
-                continue
-            state = proc.direction_states.get(direction)
-            if not state:
-                continue
-
+        for direction, state in proc.direction_states.items():
             stop_pulse = direction_stop_pulses.get(direction)
             if stop_pulse is None:
                 raw_data[f"{direction}_stop_pulse"] = common_stop_pulse

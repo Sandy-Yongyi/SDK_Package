@@ -4,8 +4,7 @@ from typing import Dict, List
 import numpy as np
 from acquisition_sdk._internal.formats.frame_by_frame.AxisFrameDataFormat import AxisData, AxisFrameData
 
-# "upper" 方向使用 X 分层找 Y 最大/最小值，其余方向使用 Y 分层找 X 最大/最小值
-_UPPER_SIDES = ("left_upper", "right_upper")
+from model.utils.LidarDirectionUtil import SPLIT_BOTTOM_DIRECTIONS, X_AXIS_DIRECTIONS, get_split_bottom_x_grid
 
 
 @lru_cache(maxsize=8)
@@ -21,17 +20,17 @@ def build_side_frame(accum: Dict[str, List[np.ndarray]], side: str, process_conf
         - 使用 combined_y_min / combined_y_max 与 y_threshold 做 Y 分层
         - 每层输出: H_Axis=Y, V_Axis_Max=X_max, V_Axis_Min=X_min
 
-    对于 left_upper / right_upper:
-        - 使用 combined_x_min / combined_x_max 与 x_threshold 做 X 分层
+    对于顶部和底部:
+        - 使用 X 范围和 x_threshold 做分层，独立原点下左右底使用同一套底部分层范围
         - 每层输出: H_Axis=X, V_Axis_Max=Y_max, V_Axis_Min=Y_min
     """
-    is_upper = side in _UPPER_SIDES
-
-    if is_upper:
+    if side in X_AXIS_DIRECTIONS:
         # X 分层参数
         h_threshold = int(process_config.get("x_threshold", 10))
         h_min = int(process_config.get("combined_x_min", 0))
         h_max = int(process_config.get("combined_x_max", 1500))
+        if side in SPLIT_BOTTOM_DIRECTIONS:
+            h_min, h_max, h_threshold = get_split_bottom_x_grid(process_config)
         # 点云列索引: H=X(col0), V=Y(col1)
         h_col, v_col = 0, 1
     else:

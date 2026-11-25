@@ -2,6 +2,14 @@
 
 本文随开发交付包提供，可独立阅读。底层采集和处理以 `acquisition_sdk` 二进制库交付，项目控制、界面、报文、运动规划及分枪规则提供 Python 源码。SDK版本通过 `acquisition_sdk.__version__` 查询，Python接口版本通过 `acquisition_sdk.SDK_API_VERSION` 查询。
 
+## SDK v0.2.0（2026-11-25）
+
+- 单台底部激光每帧采集一次。统一原点模式按 `combined_*` 滤波，保留 `down` 方向。独立原点模式沿用同一个底部坐标系，按 `left_down_*` 和 `right_down_*` 分别滤波。两个窗口重叠时，同一个点可进入两路。
+- 实时逐帧数据按方向建帧、入队。左右底共用覆盖两组窗口的 X 轴分层范围，建帧、清空和补帧使用同一套分层。TXT 支持左右底文件，也能用当前窗口分流旧的 `down_*` 文件。
+- 每台激光上报近距离点数，9 个槽位按硬件 ID 排列，未配置的位置为 0。采样失败保留该槽最近一次有效点数，另行上报设备故障。PC 侧 PLC 通信进程使用 `radius_num` 判定遮挡，设备故障和断连优先。逐帧模式沿用安全回位和恢复握手。
+- 本项目的 PLC 收发载荷仍为 **302 字节**。遮挡点数在 PC 进程间传递并用于联锁。498 字节协议的 `LidarList` 字段属于 Lab_Auto_NewNO2 项目。
+- `SDK_API_VERSION` 保持 `1`。`FrameQueueManager` 新增可选参数 `read_data_config` 和方法 `create_empty_frame_for_direction(direction)`。升级时成对更新 SDK 二进制、类型声明及开放控制代码，并将底部激光和过滤窗口配置合并到现场 TOML。
+
 ## v0.1.2（2026-11-24）
 
 - 修复斜柜体查找挂具时，扫描末尾尚未闭合的挂具可能被漏掉的问题。
@@ -201,7 +209,7 @@ SDK依然会导入开放的报文、分枪和公共工具，所以 `.pyd` 不是
 
 ### 7.2 SystemConfig.toml：雷达分组
 
-`left_lidar_ids`、`right_lidar_ids`、`left_upper_lidar_ids`、`right_upper_lidar_ids` 指定各方向的雷达ID列表，ID对应 `LidarConfig` 表名，使用字符串。改动会改变哪些雷达参与哪个方向的数据合并；空列表表示该组未配置。必须同时核对安装方向、原点与过滤范围，不能只换IP。
+`left_lidar_ids`、`right_lidar_ids`、`left_upper_lidar_ids`、`right_upper_lidar_ids`、`down_lidar_ids` 指定各方向的雷达ID列表，ID对应 `LidarConfig` 表名，使用字符串。改动会改变哪些雷达参与哪个方向的数据合并；空列表表示该组未配置。必须同时核对安装方向、原点与过滤范围，不能只换IP。
 
 ### 7.3 LidarConfig.toml：每台雷达的连接与坐标
 
@@ -237,9 +245,10 @@ SDK依然会导入开放的报文、分枪和公共工具，所以 `.pyd` 不是
 | `left_upper_x_min`、`left_upper_x_max`、`left_upper_y_min`、`left_upper_y_max` | 左上方向过滤范围 |
 | `right_upper_x_min`、`right_upper_x_max`、`right_upper_y_min`、`right_upper_y_max` | 右上方向过滤范围 |
 | `energy_percentage` | 原能量过滤比例配置；当前未发现采集流程读取该键，不应承诺修改后有效 |
+| `left_down_*`、`right_down_*` | 独立原点模式下左右底各自的 X/Y 滤波范围，均使用同一个底部坐标系 |
 | `radius_threshold`、`radius_num` | 雷达近距离遮挡检测：有效半径小于阈值的点数超过radius_num时判遮挡，不是最小有效点数；增大半径或减小数量更容易判遮挡 |
 | `x_threshold`、`y_threshold`、`z_threshold` | 点云空间分组间隔；增大使分组更粗，不能简单理解为采样频率 |
-| `left_scan_points_threshold`、`right_scan_points_threshold`、`left_upper_scan_points_threshold`、`right_upper_scan_points_threshold` | 各方向有效帧点数门槛；提高会更容易把稀疏帧判为空 |
+| `left_scan_points_threshold`、`right_scan_points_threshold`、`left_upper_scan_points_threshold`、`right_upper_scan_points_threshold`、`down_scan_points_threshold` | 各方向有效帧点数门槛；提高会更容易把稀疏帧判为空 |
 | `max_scan_length` | 当前工件最大扫描长度，达到限制会结束采集；过小会截断长工件 |
 | `plc_send_max_retries` | PLC发送重试上限；提高会延长故障处理等待，不会修复协议不匹配 |
 | `max_pulse` | 反馈脉冲回绕上限，必须与PLC一致，否则距离连续性错误 |
@@ -385,7 +394,7 @@ SDK依然会导入开放的报文、分枪和公共工具，所以 `.pyd` 不是
 
 ## 8. 更新SDK与常见问题
 
-SDK升级使用新的发布包版本，如 `0.1.2`；仍保持 `from acquisition_sdk import ...`，不要手动给模块加 `_v0_1` 后缀。ABI文件名中的 `cp311-win_amd64` 必须保留。先退出主程序和全部子进程，备份旧pyd/pyi，再成对替换；保留项目定制源码和现场TOML。回退时同样成对恢复。进程间对象应来自同一套SDK，不支持运行中热替换或跨版本保留旧队列对象。
+SDK升级使用新的发布包版本，如 `0.2.0`；仍保持 `from acquisition_sdk import ...`，不要手动给模块加 `_v0_1` 后缀。ABI文件名中的 `cp311-win_amd64` 必须保留。先退出主程序和全部子进程，备份旧pyd/pyi，再成对替换；保留项目定制源码和现场TOML。回退时同样成对恢复。进程间对象应来自同一套SDK，不支持运行中热替换或跨版本保留旧队列对象。
 
 | 问题 | 优先检查 |
 | --- | --- |

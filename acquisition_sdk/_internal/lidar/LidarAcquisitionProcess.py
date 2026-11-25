@@ -10,7 +10,7 @@ import queue
 import numpy as np
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, cast
 from model.utils.TomlLoader import TomlLoader
 from model.utils.FrameFifoConfig import get_frame_fifo_step_mm
 from acquisition_sdk._internal.lidar.LidarCommon import LidarManager
@@ -19,7 +19,8 @@ from model.utils.LoggerUtil import logger, check_and_rotate_log
 from acquisition_sdk._internal.dataprocess.DataFilter import DataFilter
 from acquisition_sdk._internal.lidar.LidarDirectionState import LidarDirectionState
 from acquisition_sdk._internal.pointcloud.PointCloudSaveBuffer import PointCloudSaveBuffer
-from model.utils.LidarDirectionUtil import filter_active_direction_map
+from model.utils.LidarDirectionUtil import (LIDAR_LIST_COUNT, SPLIT_BOTTOM_DIRECTIONS, filter_active_direction_map,
+                                            get_lidar_filter_bounds, get_point_cloud_directions)
 from model.utils.StrategyUtil import is_complete_workpiece_mode, is_continuous_bidirectional_mode, is_frame_by_frame_mode, validate_strategy_name
 from model.utils.ProcessHeartbeat import ProcessHeartbeat
 from model.utils.UiTelemetry import UiStatusPublisher
@@ -54,6 +55,13 @@ class LidarAcquisitionProcess(multiprocessing.Process):
 
         self.config_dir = config_dir
         self.lidar_config = filter_active_direction_map(lidar_config)
+        self.lidar_slots = {}
+        for lidar_ids in self.lidar_config.values():
+            for lidar_id in lidar_ids:
+                slot = int(lidar_id) - 1
+                if not 0 <= slot < LIDAR_LIST_COUNT or slot in self.lidar_slots.values():
+                    raise ValueError(f"激光 ID {lidar_id} 的 PLC 槽位无效或重复")
+                self.lidar_slots[lidar_id] = slot
         self.strategy_name = validate_strategy_name(strategy_name)
         self.pulse_queue = pulse_queue
         self.viz_queue = viz_queue
@@ -75,6 +83,8 @@ class LidarAcquisitionProcess(multiprocessing.Process):
         self.finish_test = False
         self.shutdown_flag = False
         self.lidar_status = 0
+        self.lidar_occlusion_counts = [0] * LIDAR_LIST_COUNT
+        self._last_published_lidar_feedback = None
         self.last_reported_lidar_status = 0
         self.lidar_disconnected = False
         self.plc_disconnected = False
@@ -102,13 +112,10 @@ class LidarAcquisitionProcess(multiprocessing.Process):
         self._buffer_warning = False
 
         # 方向状态
-        self.direction_states: Dict = {}
-        for direction in self.lidar_config.keys():
-            config_to_use = self.read_data_config
-            self.direction_states[direction] = LidarDirectionState(direction, config_to_use)
-
-        # 确定有配置的方向列表（避免重复检查空配置）
-        self.active_directions = list(self.lidar_config.keys())
+        self.active_directions = get_point_cloud_directions(self.lidar_config, self.read_data_config["translate_data_origin"])
+        self.direction_states = {
+            direction: LidarDirectionState(direction, self.read_data_config) for direction in self.active_directions
+        }
         logger.debug(f"Active directions with lidar configuration: {self.active_directions}")
 
         # 策略特定初始化
@@ -284,8 +291,13 @@ class LidarAcquisitionProcess(multiprocessing.Process):
         if self.save_buffer is None:
             raise RuntimeError("Point cloud save buffer is not initialized")
         current_frame_data = np.empty((0, 3))
+        bottom_added = False
         for direction, state in self.direction_states.items():
-            if state.scanning_started and state.last_same_origin_filtered.size > 0 and state.last_diff_origin_filtered.size > 0:
+            split_bottom = direction in SPLIT_BOTTOM_DIRECTIONS
+            required_points = state.last_same_origin_filtered if direction == "down" else state.last_diff_origin_filtered
+            if state.scanning_started and required_points.size > 0 and (
+                split_bottom or state.last_same_origin_filtered.size > 0
+            ):
                 same_origin_frame_data = np.column_stack((
                     state.last_same_origin_filtered[:, :2],
                     np.full(len(state.last_same_origin_filtered), z_value)
@@ -303,8 +315,10 @@ class LidarAcquisitionProcess(multiprocessing.Process):
                 if not is_frame_by_frame_mode(self.strategy_name):
                     self._processing_chunks.setdefault(direction, []).append(direction_frame)
 
-                # 添加到当前帧数据
-                current_frame_data = np.vstack((current_frame_data, same_origin_frame_data)) if current_frame_data.size > 0 else same_origin_frame_data
+                # 两路独立坐标共享同一份统一坐标的底部点云。
+                if same_origin_frame_data.size > 0 and (not split_bottom or not bottom_added):
+                    current_frame_data = np.vstack((current_frame_data, same_origin_frame_data)) if current_frame_data.size > 0 else same_origin_frame_data
+                    bottom_added = bottom_added or split_bottom
         if current_frame_data.size > 0:
             sorted_frame_data = self.data_split.AxisSorting_yx(current_frame_data, self.read_data_config["y_threshold"])
             if isinstance(sorted_frame_data, np.ndarray) and sorted_frame_data.size > 0:
@@ -555,6 +569,8 @@ class LidarAcquisitionProcess(multiprocessing.Process):
             if is_frame_by_frame_mode(self.strategy_name) and "lidar_recovery" in latest_pulse_data:
                 self._plc_manages_lidar_recovery = True
                 self._lidar_recovery_request = latest_pulse_data["lidar_recovery"]
+                if latest_pulse_data.get("lidar_occluded"):
+                    self._waiting_for_lidar_recovery = True
 
         # 检测从断连状态恢复
         if was_disconnected and not self.plc_disconnected:
@@ -587,9 +603,11 @@ class LidarAcquisitionProcess(multiprocessing.Process):
 
         self.lidar_status = 0
         direction_data = {}
-        for direction in self.active_directions:
+        filtered_points = (
+            item for source in self.lidar_config for item in self._process_direction(source).items()
+        )
+        for direction, (same_origin_filtered, diff_origin_filtered) in filtered_points:
             state = self.direction_states[direction]
-            same_origin_filtered, diff_origin_filtered = self._process_direction(direction)
 
             # 保存到方向状态
             state.last_same_origin_filtered = same_origin_filtered
@@ -633,18 +651,44 @@ class LidarAcquisitionProcess(multiprocessing.Process):
             self._push_lidar_status_update()
             return
 
+        # 没有新 FIFO 或整件数据时也及时上报变化。
+        if not is_continuous_bidirectional_mode(self.strategy_name):
+            feedback = self._lidar_feedback_packet()
+            if feedback != self._last_published_lidar_feedback:
+                self._push_lidar_status_update()
+
         # 逐帧发送方向数据（FrameByFrame策略在此处调用send_data_to_queue）
         self.strategy.send_direction_data(self, direction_data)
         self.strategy.save_valid_data(self)
         self.strategy.check_scanning_completion(self)
 
-    def _push_lidar_status_update(self, reset_queue: bool = False):
-        """向下游发送最新激光状态。"""
-        self.raw_data_queue.put({
+    def _lidar_feedback_packet(self):
+        return {
             "lidar_status": int(self.lidar_status),
+            "lidar_occlusion_counts": self.lidar_occlusion_counts.copy(),
+        }
+
+    def _push_lidar_status_update(self, reset_queue: bool = False):
+        """向下游发送最新激光设备状态和各台遮挡点数。"""
+        feedback = self._lidar_feedback_packet()
+        self.raw_data_queue.put({
+            **feedback,
             "reset_queue": bool(reset_queue),
             "plc_generation": int(self.plc_connection_generation),
         })
+        self._last_published_lidar_feedback = feedback
+
+    def _read_lidar_sample(self, lidar, lidar_id):
+        self._heartbeat.touch()
+        data, occlusion_count, scan_failed = lidar.scan()
+        self._heartbeat.touch()
+        # 无有效样本时保留该槽最近一次有效点数，设备故障另行上报。
+        if not scan_failed:
+            self.lidar_occlusion_counts[self.lidar_slots[lidar_id]] = occlusion_count
+        if self.lidar_disconnected:
+            self.lidar_reconnected = True
+        self.lidar_disconnected = False
+        return data, scan_failed
 
     def _poll_lidar_status_if_due(self, force: bool = False):
         """停止状态下周期性轮询激光状态，便于 PLC 及时联锁。"""
@@ -653,17 +697,13 @@ class LidarAcquisitionProcess(multiprocessing.Process):
             return
 
         polled_status = 0
-        for direction in self.active_directions:
-            for lidar_id in self.lidar_config.get(direction, []):
+        for direction, lidar_ids in self.lidar_config.items():
+            for lidar_id in lidar_ids:
                 lidar = self.lidar_manager.get_lidar(lidar_id)
                 try:
-                    self._heartbeat.touch()
-                    _, lidar_status = lidar.scan()
-                    self._heartbeat.touch()
-                    polled_status = max(polled_status, int(lidar_status))
-                    if self.lidar_disconnected:
-                        self.lidar_reconnected = True
-                    self.lidar_disconnected = False
+                    _, scan_failed = self._read_lidar_sample(lidar, lidar_id)
+                    if scan_failed:
+                        polled_status = max(polled_status, 2)
                 except (ConnectionResetError, BrokenPipeError, OSError) as e:
                     logger.error(f"{lidar_id} Lidar poll connection error: {str(e)}")
                     polled_status = 3
@@ -683,13 +723,9 @@ class LidarAcquisitionProcess(multiprocessing.Process):
         self._push_lidar_status_update()
 
     def _process_direction(self, direction: str):
-        """
-        处理指定方向的激光雷达数据
-        Args:
-            direction: 方向标识 ('left', 'right', 'forward', 'reverse' 等)
-        Returns:
-            (same_origin_filtered, diff_origin_filtered) - 两种坐标系的过滤点云
-        """
+        """每个物理方向采集一次，将点云按输出方向滤波。"""
+        outputs = get_point_cloud_directions((direction,), self.read_data_config["translate_data_origin"])
+        combined_bottom = outputs == ["down"]
         same_origin_all_points = []
         diff_origin_all_points = []
 
@@ -697,12 +733,7 @@ class LidarAcquisitionProcess(multiprocessing.Process):
         for lidar_id in self.lidar_config[direction]:
             lidar = self.lidar_manager.get_lidar(lidar_id)
             try:
-                self._heartbeat.touch()
-                all_data = lidar.scan()
-                self._heartbeat.touch()
-                if self.lidar_disconnected:
-                    self.lidar_reconnected = True
-                self.lidar_disconnected = False
+                data, scan_failed = self._read_lidar_sample(lidar, lidar_id)
             except (ConnectionResetError, BrokenPipeError, OSError) as e:
                 logger.error(f"{lidar_id} Lidar Connection error: {str(e)}")
                 self.lidar_status = max(self.lidar_status, 3)
@@ -710,28 +741,32 @@ class LidarAcquisitionProcess(multiprocessing.Process):
                 self._publish_ui_status(3, force=True)
                 if self.movement_detected or self.any_scanning_active:
                     self._invalidate_current_workpiece(self._text(f"{direction}方向激光 {lidar_id} 连接断开", f"{direction} lidar {lidar_id} disconnected"))
-                if not self._connect_with_retry(lidar, lidar_id, direction):
-                    return np.empty((0, 3)), np.empty((0, 3))
+                if self._connect_with_retry(lidar, lidar_id, direction):
+                    self.lidar_reconnected = True
+                    self.lidar_disconnected = False
                 # 本周期丢弃残缺采数；重连后的下一周期再发送新的完整请求。
-                self.lidar_reconnected = True
-                self.lidar_disconnected = False
-                return np.empty((0, 3)), np.empty((0, 3))
+                return {output: (np.empty((0, 3)), np.empty((0, 3))) for output in outputs}
 
-            data = all_data[0]
-            self.lidar_status = max(self.lidar_status, int(all_data[1]))
-            if int(all_data[1]) == 2 and (self.movement_detected or self.any_scanning_active):
-                self._invalidate_current_workpiece(self._text(f"{direction}方向激光 {lidar_id} 异常", f"{direction} lidar {lidar_id} reported an error"))
-            if data is not None:
-                same_origin_all_points.extend(data.same_cartesian)
+            if scan_failed:
+                self.lidar_status = max(self.lidar_status, 2)
+                if self.movement_detected or self.any_scanning_active:
+                    self._invalidate_current_workpiece(self._text(f"{direction}方向激光 {lidar_id} 异常", f"{direction} lidar {lidar_id} reported an error"))
+            same_origin_all_points.extend(data.same_cartesian)
+            if not combined_bottom:
                 diff_origin_all_points.extend(data.diff_cartesian)
 
         # 过滤并处理点云数据
-        if same_origin_all_points and diff_origin_all_points:
+        if same_origin_all_points and (combined_bottom or diff_origin_all_points):
             same_origin_filtered = self._process_lidar_data(True, same_origin_all_points, direction)
-            diff_origin_filtered = self._process_lidar_data(False, diff_origin_all_points, direction)
-            return same_origin_filtered, diff_origin_filtered
+            if combined_bottom:
+                return {direction: (same_origin_filtered, np.empty((0, 3)))}
+            diff_origin_points = np.asarray(diff_origin_all_points)
+            return {
+                output: (same_origin_filtered, self._process_lidar_data(False, diff_origin_points, output))
+                for output in outputs
+            }
 
-        return np.empty((0, 3)), np.empty((0, 3))
+        return {output: (np.empty((0, 3)), np.empty((0, 3))) for output in outputs}
 
     def _process_lidar_data(self, same_origin_type: bool, data, direction: str) -> np.ndarray:
         """处理激光雷达原始数据"""
@@ -740,16 +775,7 @@ class LidarAcquisitionProcess(multiprocessing.Process):
 
         config = self.read_data_config
 
-        if same_origin_type:
-            x_min = config["combined_x_min"]
-            x_max = config["combined_x_max"]
-            y_min = config["combined_y_min"]
-            y_max = config["combined_y_max"]
-        else:
-            x_min = config[f"{direction}_x_min"]
-            x_max = config[f"{direction}_x_max"]
-            y_min = config[f"{direction}_y_min"]
-            y_max = config[f"{direction}_y_max"]
+        x_min, x_max, y_min, y_max = get_lidar_filter_bounds(config, "combined" if same_origin_type else direction)
 
         passthrough_filtered = self.data_filter.PassThroughFilter(data, x_min, x_max, y_min, y_max)
 
@@ -824,7 +850,7 @@ class LidarAcquisitionProcess(multiprocessing.Process):
             return
 
         anchor = anchors[0]
-        anchor_pulse = anchor.stop_pulse
+        anchor_pulse = cast(int, anchor.stop_pulse)
         current_pulse = self.current_pulse
 
         for direction, state in self.direction_states.items():
@@ -948,7 +974,7 @@ class LidarAcquisitionProcess(multiprocessing.Process):
             "repeat_count": repeat_count,
             # 首启判断完成后，PLC 才能用本轮帧解除回位保护。
             "lidar_recovery_epoch": 0 if getattr(self, "software_first_start", False) else getattr(self, "lidar_recovery_epoch", 0),
-            "lidar_status": int(self.lidar_status),
+            **self._lidar_feedback_packet(),
             "plc_generation": int(self.plc_connection_generation),
         }
         for direction in self.active_directions:

@@ -60,6 +60,7 @@
       "_is_empty_data",
       "clear",
       "continuous_slot_empty",
+      "create_empty_frame_for_direction",
       "create_empty_frame_x",
       "create_empty_frame_y",
       "push_frame",
