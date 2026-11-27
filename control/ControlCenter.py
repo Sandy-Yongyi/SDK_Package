@@ -8,12 +8,13 @@ status collection, and a snapshot consumable by either wx or PyQt.
 from __future__ import annotations
 
 from collections.abc import Callable
-from queue import Empty, SimpleQueue
+from queue import Empty
 from typing import Any, Protocol
 
 from model.telemetry.UiState import LogEvent, UiState, TaskState
 from model.motionplan.motionutil.DeviceEnableHelper import validate_enable_transition
 from model.runtime.ShutdownCoordinator import ShutdownCoordinator
+from model.utils.QueueUtil import QueueLimits
 
 
 class RuntimePort(Protocol):
@@ -40,7 +41,8 @@ class ControlCenter:
         self._save_chain_speed = save_chain_speed
         self._send_control = send_control
         self._async_stop = async_stop
-        self._stop_results = SimpleQueue()
+        limits = getattr(runtime, "queue_limits", None) or QueueLimits({})
+        self._stop_results = limits.create("stop_results", local=True)
         self._startup_failed = False
         self._local_alarms: tuple[str, ...] = ()
         self._shutdown = ShutdownCoordinator(self._runtime.stop_pipeline, self._stop_results.put) if async_stop else None

@@ -124,7 +124,7 @@ point_cloud_save_shutdown_timeout_s = 120   # 等待保存排空的最长秒数�
 # =============================================================================
 # 二、按帧与完整工件共用参数（策略 1 / 2）
 # =============================================================================
-start_skip_empty_frames = 100            # 跳过工件后，连续全方向空采样次数达到此值才确认工件离开
+start_skip_empty_frames = 100            # 跳过工件后，连续全方向空采 FIFO 格数达到此值才确认工件离开
 start_skip_mm = 20                       # 启动或激光故障回位后，在该距离内检测到工件时跳过当前工件，单位 mm
 
 
@@ -153,3 +153,19 @@ swing_threshold = 3                      # 往复扫描开始和结束的边界�
 max_swing_pulse = 3000                   # 往复扫描的最大脉冲范围
 min_swing_pulse = 0                      # 激光扫描起点和启动回零位置，单位mm
 lidar_scan_speed = 25                    # 激光扫描及回零共用速度，单位mm/s；主界面Save setting保存
+
+# 各运行队列的待处理包数上限，正整数，重启后生效。
+[queue_limits]
+control = 32
+log = 128
+ui_status = 32
+pulse = 32
+preview = 2
+txt_frames = 32
+realtime_frames = 32
+raw_workpieces = 2
+processed_workpieces = 2
+save_tasks = 33  # 任务和确认队列的生效值至少为共享内存块数 + 1
+save_acks = 33
+save_status = 64
+stop_results = 1

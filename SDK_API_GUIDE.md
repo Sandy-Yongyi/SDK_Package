@@ -1,4 +1,4 @@
-# Acquisition SDK 0.2.0 接口使用说明
+# Acquisition SDK 0.2.1 接口使用说明
 
 本文对应开发发布包中的 `acquisition_sdk.pyi`（Python 3.11、Windows x64）。`.pyi` 是类型提示文件，实际执行的是同目录的 `acquisition_sdk.cp311-win_amd64.pyd`；不是单独可运行的 SDK。示例从发布包目录运行，并保留包内 `model/` 和配置文件。`Any` 表示提示文件未限定类型，不能据此认为可以传入任意对象。
 
@@ -10,7 +10,7 @@
 
 | 名称 | 功能及输入 | 输出 |
 | --- | --- | --- |
-| `__version__` | SDK 版本常量，本版为字符串 `"0.2.0"`。 | `str` |
+| `__version__` | SDK 版本常量，本版为字符串 `"0.2.1"`。 | `str` |
 | `SDK_API_VERSION` | Python 接口版本常量，本版为 `1`。 | `int` |
 | `Int16()` | `typing.Annotated` 的有符号 16 位整数字段标记，无参数。 | 标记对象，占 2 字节。 |
 | `Int32()` | 有符号 32 位整数字段标记，无参数。 | 标记对象，占 4 字节。 |

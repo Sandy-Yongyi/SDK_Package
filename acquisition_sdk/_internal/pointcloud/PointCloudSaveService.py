@@ -3,10 +3,12 @@
 import multiprocessing
 import queue
 import time
+from collections import deque
 
 from acquisition_sdk._internal.pointcloud.PointCloudSaveProcess import PointCloudSaveProcess
 from acquisition_sdk._internal.pointcloud.PointCloudSaveBuffer import SharedPointCloudPool
 from model.utils.TomlLoader import TomlLoader
+from model.utils.QueueUtil import QueueLimits
 
 
 class PointCloudSaveService:
@@ -21,14 +23,15 @@ class PointCloudSaveService:
         block_bytes = int(float(config.get("point_cloud_save_block_mb", 16)) * 1024 * 1024)
         block_count = int(config.get("point_cloud_save_block_count", 32))
         self.pool = SharedPointCloudPool.create(block_bytes, block_count)
-        self.task_queue = multiprocessing.Queue(maxsize=block_count + 1)
-        self.ack_queue = multiprocessing.Queue()
-        self.status_queue = multiprocessing.Queue()
+        limits = QueueLimits(config)
+        self.task_queue = limits.create("save_tasks", minimum=block_count + 1)
+        self.ack_queue = limits.create("save_acks", minimum=block_count + 1)
+        self.status_queue = limits.create("save_status")
         self.stop_event = multiprocessing.Event()
         self.heartbeat = multiprocessing.Value('d', time.monotonic(), lock=False)
         self.worker = PointCloudSaveProcess(self.task_queue, self.ack_queue, self.status_queue, self.pool.descriptor, output_dir, viz_queue, self.heartbeat, self.config)
         self._closed = False
-        self._errors = []
+        self._errors = deque(maxlen=64)
         self._drained = False
 
     def start(self, timeout_s: int = 10):

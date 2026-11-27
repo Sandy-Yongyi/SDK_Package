@@ -1,5 +1,6 @@
 import os
 import sys
+import queue
 import numpy as np
 import multiprocessing
 from acquisition_sdk import DataFindBlocks
@@ -24,7 +25,6 @@ class DataProcessingProcess(multiprocessing.Process):
         self.process_config = TomlLoader.load(f"{self.config_dir}\\ProcessConfig.toml")
         self.read_data_config = TomlLoader.load(f"{self.config_dir}\\ReadDataConfig.toml")
         self.draw_type = int(self.read_data_config.get("draw_type", 1))
-        self.machine_data_queue.put(0)  # 初始状态
         self.shutdown_flag = False
         # 标准输出重定向
         self.stdout = sys.stdout
@@ -51,6 +51,10 @@ class DataProcessingProcess(multiprocessing.Process):
                 else:
                     self._heartbeat.sleep(0.05)
 
+            except queue.Full as e:
+                logger.error(str(e))
+                self.machine_data_queue.cancel_join_thread()
+                return
             except Exception as e:
                 logger.error(f"Data processing error: {str(e)}")
                 self._heartbeat.sleep(0.1)

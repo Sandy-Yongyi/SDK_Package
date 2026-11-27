@@ -191,10 +191,10 @@ class FrameByFrameStrategy(AcquisitionStrategy):
         while True:
             if proc._stop_requested():
                 break
-            _, _, status = proc._update_pulse_data()
+            _, fifo, status = proc._update_pulse_data()
             proc._apply_lidar_recovery_request()
 
-            if status == "moving_forward":
+            if status == "moving_forward" and proc._should_capture_fifo(fifo):
                 if not proc.movement_detected:
                     logger.info("Forward motion start")
                     print("开始采集数据...")
@@ -232,8 +232,7 @@ class FrameByFrameStrategy(AcquisitionStrategy):
 
     def save_valid_data(self, proc):
         """保存有效数据"""
-        current_pulse, _, _ = proc._update_pulse_data()
-        proc._save_valid_data_core(proc._get_current_scan_z_value(current_pulse))
+        proc._save_valid_data_core(proc._get_current_scan_z_value(proc.current_pulse))
 
     def check_scanning_completion(self, proc):
         """检查扫描是否完成"""

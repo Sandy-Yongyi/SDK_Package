@@ -85,6 +85,7 @@ class LidarAcquisitionProcess(multiprocessing.Process):
         self.lidar_status = 0
         self.lidar_occlusion_counts = [0] * LIDAR_LIST_COUNT
         self._last_published_lidar_feedback = None
+        self._last_published_lidar_generation = None
         self.last_reported_lidar_status = 0
         self.lidar_disconnected = False
         self.plc_disconnected = False
@@ -138,6 +139,8 @@ class LidarAcquisitionProcess(multiprocessing.Process):
             self.build_side_frame = build_side_frame
             self.cm_accum: Dict = {}
             self.last_sent_fifo = -1
+            self.last_frame_capture = None
+            self._fifo_reverse_fault = False
             # 首启动跳过逻辑（工件在中间检测）
             self.software_first_start = True
             self.start_motion_pulse = None
@@ -368,7 +371,11 @@ class LidarAcquisitionProcess(multiprocessing.Process):
 
     def _update_scanning_state_base(self, direction, state):
         """扫描状态更新基础逻辑，返回 (stopped_by_points, stopped_by_max_length)"""
-        current_pulse, current_fifo, current_status = self._update_pulse_data()
+        if is_frame_by_frame_mode(self.strategy_name):
+            # The frame keeps the PLC sample selected before scanning its directions.
+            current_pulse, current_fifo, current_status = self.current_pulse, getattr(self, "current_fifo", 0), self.current_status
+        else:
+            current_pulse, current_fifo, current_status = self._update_pulse_data()
         if direction == "left":
             logger.debug(f"_update_scanning_state_base - current pulse: {current_pulse}, fifo: {current_fifo}, status: {current_status}")
         stopped_by_points = False
@@ -449,6 +456,9 @@ class LidarAcquisitionProcess(multiprocessing.Process):
 
         self.cm_accum.clear()
         self.last_sent_fifo = -1
+        self._fifo_reverse_fault = False
+        fifo = getattr(self, "current_fifo", None)
+        self.last_frame_capture = None if fifo is None else (self.plc_connection_generation, fifo)
         self.software_first_start = True
         self.start_motion_pulse = self.current_pulse if self.current_status == "moving_forward" else None
         self.fbf_skipping_workpiece = False
@@ -521,6 +531,7 @@ class LidarAcquisitionProcess(multiprocessing.Process):
     def _update_pulse_data(self):
         """更新脉冲数据 - 只消费队列中的最新值，减少积压处理开销"""
         was_disconnected = self.plc_disconnected
+        previous_generation = self.plc_connection_generation
         if self.save_buffer is not None:
             self.save_buffer.poll_acks()
         now = time.monotonic()
@@ -534,6 +545,7 @@ class LidarAcquisitionProcess(multiprocessing.Process):
                 pulse_data = self.pulse_queue.get_nowait()
                 if pulse_data.get("pulse", 0) == -999:
                     self.plc_disconnected = True
+                    self.current_status = "stopped"
                     self.plc_connection_generation = int(
                         pulse_data.get("plc_generation", self.plc_connection_generation) or 0
                     )
@@ -573,7 +585,7 @@ class LidarAcquisitionProcess(multiprocessing.Process):
                     self._waiting_for_lidar_recovery = True
 
         # 检测从断连状态恢复
-        if was_disconnected and not self.plc_disconnected:
+        if not self.plc_disconnected and (was_disconnected or self.plc_connection_generation != previous_generation):
             self.plc_reconnected = True
             if is_frame_by_frame_mode(self.strategy_name):
                 self.last_sent_fifo = int(getattr(self, "current_fifo", 0) or 0)
@@ -662,6 +674,21 @@ class LidarAcquisitionProcess(multiprocessing.Process):
         self.strategy.save_valid_data(self)
         self.strategy.check_scanning_completion(self)
 
+    def _should_capture_fifo(self, fifo: int) -> bool:
+        """同一连接内每个正向前进的 FIFO 只进入一次采集与保存流程。"""
+        if getattr(self, "_fifo_reverse_fault", False):
+            return False
+        position = (self.plc_connection_generation, fifo)
+        previous = self.last_frame_capture
+        if previous is not None and previous[0] == position[0]:
+            advance = self._get_fifo_step_delta(previous[1], fifo)
+            if advance < -(self.read_data_config.get("fifo_reverse_tolerance", 10) or 10):
+                self._handle_fifo_reverse_fault(fifo, -advance)
+            if advance <= 0:
+                return False
+        self.last_frame_capture = position
+        return True
+
     def _lidar_feedback_packet(self):
         return {
             "lidar_status": int(self.lidar_status),
@@ -671,12 +698,16 @@ class LidarAcquisitionProcess(multiprocessing.Process):
     def _push_lidar_status_update(self, reset_queue: bool = False):
         """向下游发送最新激光设备状态和各台遮挡点数。"""
         feedback = self._lidar_feedback_packet()
+        generation = int(self.plc_connection_generation)
+        if not reset_queue and feedback == getattr(self, "_last_published_lidar_feedback", None) and generation == self._last_published_lidar_generation:
+            return
         self.raw_data_queue.put({
             **feedback,
             "reset_queue": bool(reset_queue),
-            "plc_generation": int(self.plc_connection_generation),
+            "plc_generation": generation,
         })
         self._last_published_lidar_feedback = feedback
+        self._last_published_lidar_generation = generation
 
     def _read_lidar_sample(self, lidar, lidar_id):
         self._heartbeat.touch()
@@ -885,16 +916,6 @@ class LidarAcquisitionProcess(multiprocessing.Process):
     def send_data_to_queue(self, direction_data: dict):
         """累积式发送数据"""
         cur = int(self.current_fifo)
-        if cur not in self.cm_accum:
-            self.cm_accum[cur] = {}
-        for dname, darr in direction_data.items():
-            # 确保检查数据是否为numpy数组
-            is_empty = (darr is None) or (isinstance(darr, np.ndarray) and darr.size == 0) or (isinstance(darr, list) and len(darr) == 0)
-            if is_empty:
-                self.cm_accum[cur].setdefault(dname, [])
-            else:
-                self.cm_accum[cur].setdefault(dname, []).append(darr)
-
         # 首次初始化：以首次接收到的FIFO值作为起点，而不是认为有缺帧
         if self.last_sent_fifo == -1:
             self.last_sent_fifo = (cur - 1) % (self.max_fifo + 1)
@@ -927,7 +948,11 @@ class LidarAcquisitionProcess(multiprocessing.Process):
                 f"repeat current frame {fifo_delta} times to fill missing FIFOs"
             )
 
-        self._send_single_fifo(cur, cur, repeat_count=repeat_count)
+        self.cm_accum[cur] = {direction: [points] for direction, points in direction_data.items() if points is not None and len(points)}
+        try:
+            self._send_single_fifo(cur, cur, repeat_count=repeat_count)
+        finally:
+            self.cm_accum.pop(cur, None)
         self.last_sent_fifo = cur
 
     def _get_fifo_step_delta(self, last_fifo: int, current_fifo: int) -> int:
@@ -951,6 +976,9 @@ class LidarAcquisitionProcess(multiprocessing.Process):
 
     def _handle_fifo_reverse_fault(self, cur: int, backward_step: int):
         """FIFO 反向超阈值异常处理：清空数据并触发设备回安全位。"""
+        if getattr(self, "_fifo_reverse_fault", False):
+            return
+        self._fifo_reverse_fault = True
         logger.error(
             f"FIFO reverse overflow detected: last_sent={self.last_sent_fifo}, cur={cur}, "
             f"backward_step={backward_step} (>{self.read_data_config.get('fifo_reverse_tolerance', 10) or 10}), clear all data and force safe return"
@@ -959,6 +987,7 @@ class LidarAcquisitionProcess(multiprocessing.Process):
         self.cm_accum.clear()
         # 标记激光异常，让 PLC 端进入 force_disable_all 分支并执行回原点/安全位
         self.lidar_status = 2
+        self._handle_lidar_status_transition(2, source="fifo_reverse")
         self._invalidate_current_workpiece(f"FIFO后退超阈值({backward_step})")
 
     def _send_single_fifo(self, fifo_key, real_fifo_key, repeat_count: int = 1):

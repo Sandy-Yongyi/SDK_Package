@@ -50,10 +50,9 @@ class DataProcessWorker(multiprocessing.Process):
         self.all_frames = {}
         self.current_frame_index = 0
         self.max_frame_index = 0
-        self.current_pulse = 0
-        self.current_fifo = 0
+        self.plc_generation = None
+        self.queue_overflow = False
         self.max_fifo = self._get_max_chaincountcm()
-        self.accum = {direction: [] for direction in self.directions}
         self.lidar_status = 0
 
     def _get_max_chaincountcm(self):
@@ -121,7 +120,6 @@ class DataProcessWorker(multiprocessing.Process):
         dataset = datasets[next_index]
         self.current_frame_index = 0
         self.all_frames = {}
-        self.accum = {direction: [] for direction in self.directions}
         points_by_source = self._load_dataset_points(dataset)
 
         if self._uses_same_origin():
@@ -348,31 +346,38 @@ class DataProcessWorker(multiprocessing.Process):
         return np.empty((0, 3), dtype=float)
 
     def _process_frames(self):
-        """处理所有帧数据，每收到一个脉冲处理一帧"""
+        """用每次 PLC 连接的首个有效 FIFO 建立回放基准。"""
         last_fifo = None
 
         while True:
-            try:
-                self._heartbeat_touch()
-                # 获取脉冲数据
-                current_pulse, current_fifo = self._update_pulse_data()
-
-                if last_fifo is None:
-                    # 初始化last_fifo为当前fifo
-                    last_fifo = current_fifo
-                    logger.info(f"Initial FIFO set to {last_fifo}")
+            self._heartbeat_touch()
+            latest_fifo = None
+            for feedback in self._read_replay_feedback():
+                generation = feedback.get("plc_generation", 0)
+                if self.plc_generation is not None and generation < self.plc_generation:
                     continue
-
-                # 检查 fifo 是否前进，支持 chaincountcm 随 pulse 回绕后的 max -> 0
-                sent_count = self._process_fifo_advance(last_fifo, current_fifo)
-                if sent_count > 0:
+                disconnected = feedback.get("pulse") == -999
+                if generation != self.plc_generation or disconnected:
+                    self.plc_generation = generation
+                    last_fifo = latest_fifo = None
+                current_fifo = feedback.get("fifo")
+                if disconnected or current_fifo is None:
+                    continue
+                if last_fifo is None:
                     last_fifo = current_fifo
-                    if self.current_frame_index > self.max_frame_index:
-                        logger.info("All frames processed. Continue sending zero frames while FIFO increments...")
+                    logger.info(f"Initial TXT replay FIFO: {last_fifo}, PLC generation: {generation}")
+                latest_fifo = current_fifo
+            if latest_fifo is not None and self._process_fifo_advance(last_fifo, latest_fifo):
+                last_fifo = latest_fifo
 
-            except Exception as e:
-                logger.error(f"Error in frame processing: {str(e)}")
-                self._heartbeat_sleep(1)
+    def _read_replay_feedback(self):
+        """等待首条反馈，随后合并已到达的反馈，同时保留连接事件的顺序。"""
+        try:
+            yield self.pulse_queue.get(timeout=0.1)
+            for _ in range(63):
+                yield self.pulse_queue.get_nowait()
+        except queue.Empty:
+            return
 
     def _process_fifo_advance(self, last_fifo, current_fifo):
         """FIFO 每前进一格发送下一帧；FIFO 不变或倒退时不发送。"""
@@ -384,6 +389,9 @@ class DataProcessWorker(multiprocessing.Process):
         for step in range(1, step_count + 1):
             while self.current_frame_index > self.max_frame_index and self._load_next_frame_dataset():
                 pass
+            if self.current_frame_index > self.max_frame_index:
+                self._process_current_frame(real_fifo_key=current_fifo, repeat_count=step_count - step + 1)
+                break
             frame_fifo = (int(last_fifo) + step) % ring_size
             self._process_current_frame(real_fifo_key=frame_fifo, repeat_count=1)
             self.current_frame_index += 1
@@ -404,62 +412,32 @@ class DataProcessWorker(multiprocessing.Process):
 
         return 0
 
-    def _update_pulse_data(self):
-        """从队列获取脉冲数据"""
-        latest_pulse = self.current_pulse
-        latest_fifo = self.current_fifo
-        while not self.pulse_queue.empty():
-            try:
-                pulse_data = self.pulse_queue.get_nowait()
-                latest_pulse = pulse_data['pulse']
-                latest_fifo = pulse_data['fifo']
-                logger.info(f"latest_pulse is {latest_fifo}")
-            except queue.Empty:
-                break
-        if latest_pulse != self.current_pulse:
-            self.current_pulse = latest_pulse
-        if latest_fifo != self.current_fifo:
-            self.current_fifo = latest_fifo
-        return self.current_pulse, self.current_fifo
-
     def _process_current_frame(self, real_fifo_key, repeat_count):
-        """处理当前帧数据：按 FIFO 前进打包四个方向的 1 个数据包发送给 PLC。"""
-
-        # 取出当前帧四个方向点云（xyz）
-        direction_data = {}
-        for direction in self.directions:
-            direction_frames = self.all_frames.get(direction, [])
-            if self.current_frame_index < len(direction_frames):
-                direction_data[direction] = direction_frames[self.current_frame_index]
-            else:
-                direction_data[direction] = self._empty_points()
-
-        logger.info(f"Accumulating frame {self.current_frame_index}...")
-
-        for direction, points in direction_data.items():
-            if points.size > 0:
-                self.accum[direction].append(points)
-
+        """发送当前真实帧，或用一个包确认结尾的连续空格。"""
         frame_packet = {
             "fifo": real_fifo_key,
             "repeat_count": int(repeat_count),
+            "plc_generation": self.plc_generation,
             "lidar_status": int(getattr(self, "lidar_status", 0) or 0),
         }
-        frame_config = dict(self.process_config)
-        frame_config.update(self.read_data_config)
-        for direction in self.directions:
-            frame_packet[direction] = build_side_frame(self.accum, direction, frame_config)
-
-        # 清除累积器（开启下一轮）
-        self.accum = {direction: [] for direction in self.directions}
+        if self.current_frame_index > self.max_frame_index:
+            frame_packet["empty_frames"] = True
+        else:
+            frame_config = {**self.process_config, **self.read_data_config}
+            for direction in self.directions:
+                frames = self.all_frames.get(direction, [])
+                points = frames[self.current_frame_index] if self.current_frame_index < len(frames) else self._empty_points()
+                frame_packet[direction] = build_side_frame({direction: [points]}, direction, frame_config)
 
         # 发送给 PLC 进程
-        self.machine_data_queue.put(frame_packet)
+        dropped = self.machine_data_queue.put(frame_packet)
+        if dropped is not None and not self.queue_overflow:
+            detail = f"TXT 联调帧队列已满，开始丢弃最旧包。首个丢弃包 FIFO={dropped['fifo']}"
+            logger.error(detail)
+            print(detail, file=sys.stderr)
+        self.queue_overflow = dropped is not None
 
-        logger.info(
-            f"Sent FIFO {real_fifo_key}, repeat_count={repeat_count}, lidar_status={frame_packet['lidar_status']}: "
-            f"{', '.join(self.directions)} frames to PLC"
-        )
+        logger.debug(f"Sent TXT replay FIFO {real_fifo_key}, repeat_count={repeat_count}, empty_frames={frame_packet.get('empty_frames', False)}")
 
     def _process_complete_workpieces(self):
         """完整工件调试：按原点模式模拟实时采数进程发送原始数据。"""

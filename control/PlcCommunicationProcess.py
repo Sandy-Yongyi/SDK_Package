@@ -11,6 +11,7 @@ from model.utils.LoggerUtil import check_and_rotate_log, logger
 from acquisition_sdk import PlcManager
 from model.utils.TomlLoader import TomlLoader
 from model.utils.FrameFifoConfig import get_frame_fifo_step_mm
+from model.utils.QueueUtil import DEFAULT_QUEUE_LIMITS
 from model.utils.LidarDirectionUtil import LIDAR_LIST_COUNT
 from model.MovingFrameData import ReceiveMovingFrameData, SendMovingFrameData
 from acquisition_sdk import FrameQueueManager
@@ -84,6 +85,13 @@ class PlcCommunicationProcess(multiprocessing.Process):
         self.plc_connected = False
         self.plc_reconnect_pending = False
         self.plc_connection_generation = 0
+        self.txt_frame_replay = False
+        self.txt_replay_queue_limit = DEFAULT_QUEUE_LIMITS["txt_frames"]
+        self.txt_replay_applied_fifo = None
+        self.txt_replay_fault = ""
+        self.realtime_overflow = None
+        self.realtime_queue_fault = ""
+        self._txt_replay_empty_frames: dict[str, AxisFrameData] = {}
         self.pulse_history = []
         self.chain_motion_status = "stopped"
         self.lidar_status = 0
@@ -337,7 +345,7 @@ class PlcCommunicationProcess(multiprocessing.Process):
             self.plc = self.plc_manager.get_plc("1")
 
             # 初始连接
-            if not self.plc.connect(self.connection_type):
+            if not self._connect_plc(self.plc):
                 # 初始连接失败后尝试重连
                 if not self._handle_connection_error(self.plc):
                     logger.error("PLC initial connection failed permanently. Exiting process.")
@@ -352,6 +360,19 @@ class PlcCommunicationProcess(multiprocessing.Process):
             logger.error(f"Connection initialization failed: {str(e)}")
             return False
 
+    def _connect_plc(self, plc):
+        if not plc.connect(connection_type=self.connection_type):
+            return False
+        if self.connection_type == "tcp":
+            # PLC 在每次建立 TCP 连接后，都需要先收到完整数据帧才会应答读请求。
+            try:
+                plc.send_frame(SendMovingFrameData())
+            except OSError as e:
+                logger.warning(f"Failed to send PLC initial frame: {e}")
+                plc.disconnect(connection_type=self.connection_type)
+                return False
+        return True
+
     def _run_main_loop(self):
         """主处理循环，同时处理模拟和实际模式"""
         while True:
@@ -359,18 +380,12 @@ class PlcCommunicationProcess(multiprocessing.Process):
             self._heartbeat.touch()
             if not self._update_plc_data():
                 continue
-            if is_continuous_bidirectional_mode(self.strategy_name):
-                self._process_continuous_scan_cycle()
-            elif is_complete_workpiece_mode(self.strategy_name):
-                self._process_workpiece_data()
-                self._sync_complete_workpiece_positions()
-            else:
-                self.current_cycle_raw_shift_steps = 0
-                self._process_frame_data()
-                self._sync_frame_queue_with_chain_fifo()
+            if not self._handle_realtime_queue_overflow():
+                self._process_pending_scan_data()
             self._update_enable_value()
             check_and_rotate_log()
             # 处理数据发送，发送给PLC
+            self._handle_realtime_queue_overflow()
             moving_frame = self._axis_to_moving_frame()
             if not self.simulation_mode:
                 # logger.info(f"PLC Operate=0b{int(self.plc_data.Operate):016b}")
@@ -383,6 +398,31 @@ class PlcCommunicationProcess(multiprocessing.Process):
                     raise
             if is_continuous_bidirectional_mode(self.strategy_name):
                 self._publish_continuous_scan_state()
+
+    def _process_pending_scan_data(self) -> None:
+        if is_continuous_bidirectional_mode(self.strategy_name):
+            self._process_continuous_scan_cycle()
+        elif is_complete_workpiece_mode(self.strategy_name):
+            self._process_workpiece_data()
+            self._sync_complete_workpiece_positions()
+        else:
+            self.current_cycle_raw_shift_steps = 0
+            self._process_frame_data()
+            self._sync_frame_queue_with_chain_fifo()
+
+    def _handle_realtime_queue_overflow(self) -> bool:
+        overflow = self.realtime_overflow
+        if overflow is None or not overflow.is_set():
+            return False
+        if not self.realtime_queue_fault:
+            self.realtime_queue_fault = "实时数据队列已满，已进入故障保护，请排查处理速度后重新启动。"
+            logger.error(self.realtime_queue_fault)
+            if is_continuous_bidirectional_mode(self.strategy_name):
+                self.lidar_status = 2
+                self.continuous_scan._fault(self.realtime_queue_fault)
+            else:
+                self._update_lidar_status(2)
+        return True
 
     def _update_plc_data(self):
         try:
@@ -475,6 +515,8 @@ class PlcCommunicationProcess(multiprocessing.Process):
             device_enable_mask=int(getattr(self, "device_enable_mask", 0)),
             device_enable_request_id=getattr(self, "_enable_request_id", None),
             device_enable_error=getattr(self, "_enable_error", ""),
+            txt_replay_fault=getattr(self, "txt_replay_fault", ""),
+            realtime_queue_fault=getattr(self, "realtime_queue_fault", ""),
             motion=(getattr(self.continuous_scan, "motion_status", "stopped")
                     if is_continuous_bidirectional_mode(self.strategy_name) and hasattr(self, "continuous_scan")
                     else self.chain_motion_status),
@@ -525,6 +567,8 @@ class PlcCommunicationProcess(multiprocessing.Process):
             if status in ("moving_forward", "moving_reverse") and last_status == "stopped":
                 self._reset_raw_data_timeout_timer(fifo=fifo)
         logger.info(f"PLC chain status changed: pulse={pulse}, fifo={fifo}, status={status}")
+        if self.txt_frame_replay:
+            self._sync_txt_replay_position(fifo)
         self._publish_chain_state(fifo, pulse, status)
 
     def _publish_chain_state(self, fifo, pulse, status):
@@ -559,6 +603,9 @@ class PlcCommunicationProcess(multiprocessing.Process):
 
     def _process_frame_data(self):
         """逐帧处理激光采集队列。"""
+        if self.txt_frame_replay:
+            self._process_txt_replay_frames()
+            return
         if self.lidar_recovery_required and not self._should_skip_raw_packet():
             self._start_lidar_recovery_if_needed()
         try:
@@ -568,6 +615,8 @@ class PlcCommunicationProcess(multiprocessing.Process):
                 except Empty:
                     break
                 if not isinstance(fifo_data, dict):
+                    continue
+                if self.realtime_overflow is not None and fifo_data.get("plc_generation", self.plc_connection_generation) != self.plc_connection_generation:
                     continue
                 self._update_lidar_status_from_packet(fifo_data)
                 if self._should_skip_raw_packet():
@@ -599,6 +648,74 @@ class PlcCommunicationProcess(multiprocessing.Process):
                     self._handle_frame_packet_received(fifo_data, repeat_count)
         except Exception as e:
             logger.error(f"Error processing raw data from queue: {e}")
+
+    def _process_txt_replay_frames(self) -> None:
+        if self._should_skip_raw_packet():
+            return
+        for _ in range(self.txt_replay_queue_limit):
+            try:
+                packet = self.raw_data_queue.get_nowait()
+            except Empty:
+                return
+            repeat_count = int(packet["repeat_count"])
+            placement = self._align_txt_replay_packet(packet, repeat_count, self.plc_data.ChainCountCM)
+            if placement is None:
+                continue
+            offset, repeat_count = placement
+            if packet.get("empty_frames"):
+                self._handle_frame_packet_received(packet, repeat_count)
+                continue
+            written = False
+            for direction in self.frame_queue_manager.active_directions:
+                frame = packet.get(direction)
+                stack = self.frame_queue_manager.frame_stack[direction]
+                end = min(offset + repeat_count, len(stack))
+                if isinstance(frame, AxisFrameData) and offset < end:
+                    stack[offset:end] = [frame] * (end - offset)
+                    written = True
+            if written:
+                self._handle_frame_packet_received(packet, repeat_count)
+
+    def _sync_txt_replay_position(self, fifo: int) -> None:
+        """让帧栈跟随实际 PLC 位置，预留在途帧与缺失帧的位置。"""
+        previous = self.last_synced_chain_fifo
+        advance = 0 if previous is None else self._get_fifo_step_delta(previous, fifo)
+        if advance > 0:
+            self._push_empty_frames(advance)
+        elif advance < 0:
+            self._clear_all_frame_queues()
+            self.txt_replay_applied_fifo = fifo
+        self.last_synced_chain_fifo = fifo
+        if self.plc_reconnect_pending:
+            self.txt_replay_applied_fifo = fifo
+            self.plc_reconnect_pending = False
+        elif self.txt_replay_applied_fifo is None:
+            self.txt_replay_applied_fifo = fifo
+
+    def _align_txt_replay_packet(self, packet: dict, repeat_count: int, current_fifo: int) -> tuple[int, int] | None:
+        """返回包在已同步帧栈中的偏移和有效步数。"""
+        end_fifo = packet.get("fifo")
+        if end_fifo is None or packet.get("plc_generation") != self.plc_connection_generation or self.txt_replay_applied_fifo is None:
+            return None
+        lag = self._get_fifo_step_delta(end_fifo, current_fifo)
+        if lag < 0:
+            return None
+        if lag > self.txt_replay_queue_limit:
+            self._report_txt_replay_fault(f"TXT 联调帧落后超过 {self.txt_replay_queue_limit} 格，已跳过过期包并等待同步。")
+            return None
+        advance = self._get_fifo_step_delta(self.txt_replay_applied_fifo, end_fifo)
+        if advance <= 0:
+            return None
+        gap = advance - repeat_count
+        if gap > 0:
+            self._report_txt_replay_fault(f"TXT 联调缺少 {gap} 格，已补空并按 PLC FIFO 重新对齐。")
+        self.txt_replay_applied_fifo = end_fifo
+        return lag, min(advance, repeat_count)
+
+    def _report_txt_replay_fault(self, detail: str) -> None:
+        if detail != self.txt_replay_fault:
+            logger.error(detail)
+        self.txt_replay_fault = detail
 
     def _start_lidar_recovery_if_needed(self):
         if self._lidar_recovery_request is not None:
@@ -680,7 +797,10 @@ class PlcCommunicationProcess(multiprocessing.Process):
             logger.error(error)
             print(f"Lidar scan fault: {error}; resolve the fault and restart the software.")
         pulse = self.continuous_scan.pulse
-        self.pulse_queue.put({"pulse": pulse, "fifo": self._pulse_to_chaincountcm(pulse), "status": self.continuous_scan.motion_status})
+        self.pulse_queue.put({
+            "pulse": pulse, "fifo": self._pulse_to_chaincountcm(pulse), "status": self.continuous_scan.motion_status,
+            "plc_generation": self.plc_connection_generation,
+        })
 
     def _process_workpiece_data(self):
         """complete_workpiece 模式处理整件数据队列。"""
@@ -762,7 +882,12 @@ class PlcCommunicationProcess(multiprocessing.Process):
             return
 
         for direction in tuple(self.frame_queue_manager.frame_stack.keys()):
-            empty_frame = self.frame_queue_manager.create_empty_frame_for_direction(direction)
+            if self.txt_frame_replay:
+                if direction not in self._txt_replay_empty_frames:
+                    self._txt_replay_empty_frames[direction] = self.frame_queue_manager.create_empty_frame_for_direction(direction)
+                empty_frame = self._txt_replay_empty_frames[direction]
+            else:
+                empty_frame = self.frame_queue_manager.create_empty_frame_for_direction(direction)
             self.frame_queue_manager.push_frame(direction, empty_frame, repeat_count=repeat_count)
 
     def _sync_frame_queue_with_chain_fifo(self):
@@ -772,6 +897,12 @@ class PlcCommunicationProcess(multiprocessing.Process):
             return
 
         current_fifo = int(getattr(self.plc_data, "ChainCountCM", 0) or 0)
+        if self.txt_frame_replay:
+            was_timeout_active = self.raw_data_timeout_active
+            self._update_raw_data_watchdog()
+            if self.raw_data_timeout_active and not was_timeout_active:
+                self.txt_replay_applied_fifo = current_fifo
+            return
         if self._should_skip_raw_packet() or self.lidar_recovery_required:
             self.last_synced_chain_fifo = current_fifo
             self.current_cycle_raw_shift_steps = 0
@@ -1157,7 +1288,7 @@ class PlcCommunicationProcess(multiprocessing.Process):
                     pass
                 self._heartbeat.sleep(10)
                 # 尝试重连
-                if plc.connect(connection_type=self.connection_type):
+                if self._connect_plc(plc):
                     logger.info("PLC reconnected successfully")
                     print(self._text("PLC重连成功.", "PLC reconnected."))
                     self.plc_connected = True

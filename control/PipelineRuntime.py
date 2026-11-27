@@ -10,11 +10,13 @@ import multiprocessing
 import os
 import queue
 import time
+from collections import deque
 from typing import Any
 
 from model.utils.ConfigurationService import ConfigurationService
 from acquisition_sdk import LidarAcquisitionProcess
 from control.PlcCommunicationProcess import PlcCommunicationProcess
+from model.utils.QueueUtil import QueueLimits
 from model.telemetry.RuntimeStateCollector import RuntimeStateCollector
 from model.runtime.ProcessHealthMonitor import ProcessHealthMonitor
 from acquisition_sdk import PointCloudFileProcess, resolve_txt_files
@@ -30,6 +32,8 @@ from model.utils.UiTelemetry import UiStatusPublisher
 
 
 class SubprocessRedirect:
+    MAX_LOG_CHARS = 4096
+
     def __init__(self, output_queue, is_stderr: bool = False):
         self.output_queue = output_queue
         self.is_stderr = is_stderr
@@ -40,13 +44,20 @@ class SubprocessRedirect:
         while "\n" in self._pending:
             line, self._pending = self._pending.split("\n", 1)
             if line.strip():
-                self.output_queue.put(("stderr" if self.is_stderr else "stdout", line.rstrip("\r")))
+                self._publish(line.rstrip("\r"))
+        self._pending = self._pending[:self.MAX_LOG_CHARS]
         return len(text)
 
     def flush(self) -> None:
         if self._pending:
-            self.output_queue.put(("stderr" if self.is_stderr else "stdout", self._pending))
+            self._publish(self._pending)
             self._pending = ""
+
+    def _publish(self, line: str) -> None:
+        try:
+            self.output_queue.put_nowait(("stderr" if self.is_stderr else "stdout", line[:self.MAX_LOG_CHARS]))
+        except queue.Full:
+            pass
 
 
 class PipelineRuntime:
@@ -68,9 +79,10 @@ class PipelineRuntime:
         self.chain_speed = int(self.read_data_config.get("lidar_scan_speed", 25))
         self.process_heartbeat_interval_s = float(self.read_data_config.get("process_heartbeat_interval_s", 1))
         self.process_unresponsive_timeout_s = int(self.read_data_config.get("process_unresponsive_timeout_s", 60))
-        self.control_queue = multiprocessing.Queue()
-        self.log_queue = multiprocessing.Queue()
-        self.ui_status_queue = multiprocessing.Queue(maxsize=32)
+        self.queue_limits = QueueLimits(self.read_data_config)
+        self.control_queue = self.queue_limits.create("control", nonblocking=True)
+        self.log_queue = self.queue_limits.create("log")
+        self.ui_status_queue = self.queue_limits.create("ui_status")
         self._ui_feedback: dict[str, dict] = {}
         self.processes: list[Any] = []
         self.process_heartbeats: dict[Any, Any] = {}
@@ -82,7 +94,7 @@ class PipelineRuntime:
         self.running = False
         self._requested_device_enable_mask = 0
         self._enable_request_id = 0
-        self._faults: list[str] = []
+        self._faults: deque[str] = deque(maxlen=10)
         self.filter = DataFilter()
         self.collector = RuntimeStateCollector(self.log_queue, self.filter, float(self.read_data_config.get("point_cloud_preview_voxel_mm", 10)))
         self.health_monitor = ProcessHealthMonitor(self.process_unresponsive_timeout_s)
@@ -115,15 +127,18 @@ class PipelineRuntime:
                 raise ValueError(f"设备配置无法加载：{machine_path}；{exc}") from exc
         self._ui_feedback.clear()
         self._requested_device_enable_mask = 0
-        self.ui_status_queue = multiprocessing.Queue(maxsize=32)
+        self.ui_status_queue = self.queue_limits.create("ui_status")
         self._faults.clear()
         if self.control_type != 3:
             manage_log_files(log_directory)
         self.mode_config = mode_config
         spray_mode = int(self.mode_config.get("spray_mode", 0) or 0)
-        raw_data_queue = multiprocessing.Queue()
-        pulse_queue = multiprocessing.Queue()
-        viz_queue = multiprocessing.Queue(maxsize=2)
+        txt_frame_replay = self.control_type == 1 and self.strategy_name == "frame_by_frame"
+        realtime_overflow = multiprocessing.Event() if self.control_type == 2 else None
+        raw_channel = "txt_frames" if txt_frame_replay else "realtime_frames" if self.strategy_name == "frame_by_frame" else "raw_workpieces"
+        raw_data_queue = self.queue_limits.create(raw_channel, drop_oldest=txt_frame_replay, overflow=realtime_overflow)
+        pulse_queue = self.queue_limits.create("pulse", drop_oldest=True)
+        viz_queue = self.queue_limits.create("preview")
         self.collector.set_visualization_queue(viz_queue)
         machine_data_queue = None
         if self.control_type == 1:
@@ -173,7 +188,7 @@ class PipelineRuntime:
             self._register(self.lidar_acquisition, heartbeat)
         if is_complete_workpiece_mode(self.strategy_name):
             from control.DataProcessingProcess import DataProcessingProcess
-            machine_data_queue = multiprocessing.Queue()
+            machine_data_queue = self.queue_limits.create("processed_workpieces", overflow=realtime_overflow)
             heartbeat = self._heartbeat()
             processor = DataProcessingProcess(raw_data_queue, machine_data_queue, viz_queue, self.toml_path, heartbeat, self.process_heartbeat_interval_s)
             processor.daemon = True
@@ -189,6 +204,10 @@ class PipelineRuntime:
             heartbeat_interval_s=self.process_heartbeat_interval_s,
         )
         plc.daemon = True
+        plc.txt_frame_replay = txt_frame_replay
+        if txt_frame_replay:
+            plc.txt_replay_queue_limit = raw_data_queue.capacity
+        plc.realtime_overflow = realtime_overflow
         plc.ui_status = UiStatusPublisher(self.ui_status_queue, "plc")
         plc.stdout = SubprocessRedirect(self.log_queue)
         plc.stderr = SubprocessRedirect(self.log_queue, is_stderr=True)
@@ -252,7 +271,7 @@ class PipelineRuntime:
             snapshot["chain_status"] = detail
             snapshot["task"] = TaskState(name="TXT 点云查看", stage=detail)
             snapshot["devices"] = tuple(DeviceState(name, False, "文件查看 · 不启用") for name in ("PLC", "激光", "伺服"))
-            snapshot["alarms"] = tuple(self._faults[-10:])
+            snapshot["alarms"] = tuple(self._faults)
             return snapshot
         now = time.monotonic()
 
@@ -296,13 +315,23 @@ class PipelineRuntime:
             DeviceState("激光", lidar_online, lidar_detail),
             DeviceState("伺服", servo_ready, servo_detail),
         )
-        alarms = tuple(self._faults[-10:])
+        snapshot["alarms"] = self._device_alarms(plc_online, plc_feedback, snapshot["all_devices_safe"], servo_ready)
+        return snapshot
+
+    def _device_alarms(self, plc_online, plc_feedback, all_devices_safe, servo_ready) -> tuple[str, ...]:
+        alarms = tuple(self._faults)
+        replay_fault = plc_feedback.get("txt_replay_fault")
+        if replay_fault:
+            alarms = (replay_fault,) + alarms
+        realtime_fault = plc_feedback.get("realtime_queue_fault")
+        if realtime_fault:
+            alarms = (realtime_fault,) + alarms
         if plc_online and self.strategy_name == "frame_by_frame":
             lidar_status = plc_feedback.get("lidar_status")
             fault_text = {1: "激光有遮挡", 2: "激光异常", 3: "激光断连"}.get(lidar_status)
             returning = plc_feedback.get("lidar_fault_return_pending", False)
             if fault_text:
-                if snapshot["all_devices_safe"] and not returning:
+                if all_devices_safe and not returning:
                     lidar_notice = f"{fault_text}，设备已回到安全位置。"
                 elif servo_ready:
                     lidar_notice = f"{fault_text}，设备正在回安全位置。"
@@ -316,8 +345,7 @@ class PipelineRuntime:
                 if not returning and plc_feedback.get("lidar_recovery_required"):
                     lidar_notice = "激光已恢复正常，正在确认工件通过。"
                 alarms = (lidar_notice,) + alarms
-        snapshot["alarms"] = alarms
-        return snapshot
+        return alarms
 
     def save_chain_speed(self, speed: int) -> None:
         if self.control_type == 3:
@@ -329,11 +357,15 @@ class PipelineRuntime:
     def send_control(self, command: dict[str, int]) -> None:
         if self.control_type == 3:
             raise RuntimeError("文件查看模式不能发送设备命令")
-        if "device_enable_mask" in command:
-            self._enable_request_id += 1
-            command = {**command, "device_enable_request_id": self._enable_request_id}
-        self.control_queue.put(command)
-        if "device_enable_mask" in command:
+        is_enable_request = "device_enable_mask" in command
+        if is_enable_request:
+            command = {**command, "device_enable_request_id": self._enable_request_id + 1}
+        try:
+            self.control_queue.put_nowait(command)
+        except queue.Full:
+            raise RuntimeError("PLC 命令队列已满，请等待 PLC 处理后重试") from None
+        if is_enable_request:
+            self._enable_request_id = command["device_enable_request_id"]
             mask = int(command["device_enable_mask"]) & 0x7F
             self._requested_device_enable_mask = mask if mask & 1 else 0
 

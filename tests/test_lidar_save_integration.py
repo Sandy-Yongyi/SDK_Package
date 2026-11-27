@@ -2,6 +2,7 @@ import multiprocessing as mp
 import queue
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -390,6 +391,102 @@ class AcquisitionSavingTests(unittest.TestCase):
             self.assertEqual(message["lidar_occlusion_counts"], [0] * 8 + [42])
             self.assertEqual(message["plc_generation"], 7)
             self.assertEqual(len(message["left"].FrameData), 50)
+
+    def test_repeated_fifo_samples_leave_no_old_point_cloud_buckets(self):
+        from acquisition_sdk._internal.dataprocess.frame_by_frame.BuildSideFrame import build_side_frame
+
+        self.process.raw_data_queue = queue.Queue()
+        self.process.cm_accum = {}
+        self.process.build_side_frame = build_side_frame
+        self.process.last_sent_fifo = -1
+        self.process.max_fifo = 400
+        self.process.active_directions = ["left"]
+        self.process.lidar_status = 0
+        for fifo in (325, 325, 326, 326, 338, 338, 339):
+            self.process.current_fifo = fifo
+            self.process.send_data_to_queue({"left": np.array([[100, 200], [300, 400]])})
+        self.assertEqual({}, self.process.cm_accum)
+        packets = [self.process.raw_data_queue.get_nowait() for _ in range(4)]
+        self.assertEqual([(325, 1), (326, 1), (338, 12), (339, 1)], [(packet["fifo"], packet["repeat_count"]) for packet in packets])
+        self.assertTrue(self.process.raw_data_queue.empty())
+
+    def test_mode_two_sustained_realtime_traffic_releases_old_cache_and_latches_backpressure(self):
+        from acquisition_sdk import build_side_frame
+        from model.utils.QueueUtil import QueueLimits
+
+        process = self.process
+        overflow = mp.Event()
+        limits = QueueLimits({"queue_limits": {"realtime_frames": 2}})
+        frames = limits.create("realtime_frames", overflow=overflow)
+        self.addCleanup(frames.close)
+        process.raw_data_queue = frames
+        process.cm_accum = {}
+        process.last_sent_fifo = -1
+        process.max_fifo = 99
+        process.active_directions = ["left"]
+        process.build_side_frame = build_side_frame
+        process.lidar_status = 0
+        process.read_data_config.update(combined_y_min=0, combined_y_max=400, y_threshold=100)
+        points = {"left": np.array([[100, 200]])}
+        for step in range(1000):
+            process.current_fifo = step % 100
+            process.send_data_to_queue(points)
+            process.send_data_to_queue(points)
+            self.assertEqual(process.current_fifo, frames.get(timeout=2)["fifo"])
+        self.assertFalse(overflow.is_set())
+        self.assertEqual({}, process.cm_accum)
+        for fifo in (0, 1):
+            process.current_fifo = fifo
+            process.send_data_to_queue(points)
+        process.current_fifo = 2
+        with self.assertRaises(queue.Full):
+            process.send_data_to_queue(points)
+        self.assertTrue(overflow.is_set())
+        self.assertEqual([0, 1], [frames.get(timeout=2)["fifo"] for _ in range(2)])
+        self.assertEqual({}, process.cm_accum)
+
+    def test_realtime_capture_accepts_each_forward_position_once(self):
+        self.process.last_frame_capture = None
+        self.process.max_fifo = 339
+        observed = (337, 337, 336, 338, 338, 339, 0, 0, 1)
+        captured = [fifo for fifo in observed if self.process._should_capture_fifo(fifo)]
+        self.assertEqual([337, 338, 339, 0, 1], captured)
+        self.process.plc_connection_generation += 1
+        self.assertTrue(self.process._should_capture_fifo(1))
+
+    def test_realtime_capture_uses_one_plc_sample_for_scanning_and_saved_z(self):
+        from acquisition_sdk._internal.lidar.LidarAcquisitionStrategies import FrameByFrameStrategy
+
+        self.process.strategy_name = "frame_by_frame"
+        self.process.current_pulse = 3260
+        self.process.current_fifo = 326
+        self.process.current_status = "moving_forward"
+        state = Mock(scanning_started=False, has_scanned=False, start_pulse=None)
+        state.should_start_scanning.return_value = False
+        strategy = FrameByFrameStrategy({})
+        with patch.object(self.process, "_update_pulse_data") as update, patch.object(self.process, "_save_valid_data_core"), \
+                patch.object(self.process, "_get_current_scan_z_value") as to_z:
+            strategy.update_scanning_state(self.process, "left", state, None, None)
+            strategy.save_valid_data(self.process)
+        update.assert_not_called()
+        to_z.assert_called_once_with(3260)
+
+    def test_realtime_capture_rebases_after_recovering_from_a_fifo_reverse_fault(self):
+        self.process.strategy_name = "frame_by_frame"
+        self.process.cm_accum = {}
+        self.process.last_sent_fifo = 100
+        self.process.current_status = "moving_forward"
+        self.process.current_pulse = 700
+        self.process.current_fifo = 70
+        self.process.last_frame_capture = (self.process.plc_connection_generation, 100)
+        self.process.max_fifo = 200
+        with patch.object(self.process, "_invalidate_current_workpiece") as invalidate:
+            self.assertFalse(self.process._should_capture_fifo(70))
+            self.assertFalse(self.process._should_capture_fifo(71))
+        invalidate.assert_called_once()
+        self.process._rearm_startup_guard_after_lidar_recovery()
+        self.assertFalse(self.process._should_capture_fifo(70))
+        self.assertTrue(self.process._should_capture_fifo(71))
 
     def test_reset_discards_active_blocks_without_releasing_pending_save(self):
         from acquisition_sdk._internal.lidar.LidarDirectionState import LidarDirectionState

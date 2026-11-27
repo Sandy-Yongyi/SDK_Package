@@ -33,7 +33,7 @@ class SdkContractTests(unittest.TestCase):
         code = """
 import sys, multiprocessing
 import acquisition_sdk as sdk
-assert (sdk.__version__, sdk.SDK_API_VERSION) == ('0.2.0', 1)
+assert (sdk.__version__, sdk.SDK_API_VERSION) == ('0.2.1', 1)
 from acquisition_sdk import BlockData, AxisFrameData, PlcFrame, Int16
 assert 'model.utils.LoggerUtil' not in sys.modules
 assert 'open3d' not in sys.modules
